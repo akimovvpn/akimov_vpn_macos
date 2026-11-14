@@ -1,0 +1,15 @@
+{
+  "version": "v1.19.33-akimov.5",
+  "upstream": "https://github.com/MetaCubeX/mihomo/tree/v1.19.33",
+  "source_archive_sha256": "bb705aa873fc0e9db352fdc69b992c93fad5b310756e0e5f81194a0e0c108e21",
+  "target": "darwin-arm64",
+  "binary_sha256": "f5dd6fdcbeb0385868cb119d18d7f28748243410647ac6a48394b1c6c9de3a1d",
+  "geoip_sha256": "ac7d00ebe38b7397254e9d6304f8180a62ae573555efc48e3fdc36630d59b9df",
+  "geosite_sha256": "3642ffb0dd8b9d820b000420dd2d6c5b8e3989f4e7055e1b55978294f6d62b50",
+  "toolchain": "go version go1.26.10 darwin/arm64",
+  "patch_sha256": "ee341e3705afa7e8b75b54482f5a3886956780b65489d85d679bcf5c398d0875",
+  "url_test_patch_sha256": "252155980ac47f902b1d6785cc0edd95d750ebdc9822630add4510798dafeee7",
+  "url_test_keepalive_patch_sha256": "f7302f5647a7e9969b6d38f5fee557afb3bea98b133a9f90b0271453b9c9918f",
+  "url_test_recovery_patch_sha256": "c4dfaa975e31d329fdb24822eaeba7e0f86c1e88c661a4ca5fa024ed71d8cf0b",
+  "startup_ready_patch_sha256": "56e1711b8d6c9bdde367afaf12427d62df8b4fbeff543583684cb6841cf5358e"
+}

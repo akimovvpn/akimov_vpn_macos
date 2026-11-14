@@ -1,0 +1,79 @@
+name: macOS
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy rustfmt
+      - name: Check release version
+        run: |
+          node - <<'JS'
+          const assert=require('node:assert/strict'),fs=require('node:fs');
+          const config=require('./app/src-tauri/tauri.conf.json');
+          assert(fs.readFileSync('app/src-tauri/Cargo.toml','utf8').includes(`version = "${config.version}"`));
+          if(process.env.GITHUB_REF_TYPE==='tag')assert.equal(process.env.GITHUB_REF_NAME,'v'+config.version);
+          JS
+      - name: Build the verified patched core
+        run: ./app/build-core.sh '${{ matrix.arch }}'
+      - name: Check Rust and UI
+        run: |
+          cargo fmt --manifest-path app/src-tauri/Cargo.toml -- --check
+          cargo test --locked --manifest-path app/src-tauri/Cargo.toml
+          cargo clippy --locked --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings
+          node app/tests/ui.test.cjs
+          node app/tests/macos.test.cjs
+          node app/tests/telegram-auth.cjs
+          node app/tests/ui-render.cjs
+      - name: Check core interoperability and ownership without changing networking
+        run: |
+          ./app/tests/prepare-interop.sh
+          node app/tests/core-interop.cjs
+          node app/tests/core-selection.cjs
+          node app/tests/core-ready.cjs
+          cargo build --locked --manifest-path app/src-tauri/Cargo.toml
+          node app/tests/macos-lifecycle.cjs
+      - name: Build .app and DMG
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./app/build.sh
+      - name: Include upstream source for the bundled GPL core
+        run: cp .tools/mihomo-v1.19.33.zip app/dist/mihomo-v1.19.33-upstream-source.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: akimov-vpn-macos-${{ matrix.arch }}
+          path: app/dist/**
+          if-no-files-found: error

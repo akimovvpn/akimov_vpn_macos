@@ -1,0 +1,40 @@
+[package]
+name = "akimov-vpn"
+version = "1.0.13"
+edition = "2021"
+description = "akimov vpn for macOS"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+base64 = "0.22"
+regex = "1"
+sha2 = "0.10"
+serde_yaml = "0.9"
+# Use the system TLS trust store.
+ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
+native-tls = "0.2"
+libc = "0.2"
+core-foundation = "0.10"
+security-framework = "3"
+tauri-plugin-single-instance = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# macOS 27 rejects the misaligned LINKEDIT produced by stripping Rust proc-macro dylibs.
+[profile.release.build-override]
+strip = false
