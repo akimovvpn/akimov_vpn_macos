@@ -13,9 +13,20 @@ async function screenshot(name){const r=await call('Page.captureScreenshot',{for
  const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const debug=probe.address().port;await new Promise(r=>probe.close(r));
  const profile=fs.mkdtempSync(path.join(os.tmpdir(),'akimov-ui-'));
  const chrome=process.env.CHROME||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
- browser=spawn(chrome,['--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check','--remote-debugging-port='+debug,'--user-data-dir='+profile,'--window-size=1060,740','about:blank'],{windowsHide:true,stdio:'ignore'});
- let tabs;for(let i=0;i<100;i++){try{tabs=await(await fetch('http://127.0.0.1:'+debug+'/json')).json();if(tabs.find(t=>t.type==='page'))break}catch{}await wait(50)}
- ws=new WebSocket(tabs.find(t=>t.type==='page').webSocketDebuggerUrl);await new Promise(r=>ws.addEventListener('open',r));
+ let launchError, browserLog='';
+ browser=spawn(chrome,['--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check','--remote-debugging-port='+debug,'--user-data-dir='+profile,'--window-size=1060,740','about:blank'],{windowsHide:true,stdio:['ignore','ignore','pipe']});
+ browser.on('error',error=>launchError=error);
+ browser.stderr.on('data',chunk=>browserLog=(browserLog+chunk.toString()).slice(-4096));
+ let page;const deadline=Date.now()+30000;
+ while(Date.now()<deadline){
+  if(launchError)throw launchError;
+  if(browser.exitCode!==null||browser.signalCode!==null)throw Error('Chrome stopped during startup: '+browserLog);
+  try{const response=await fetch('http://127.0.0.1:'+debug+'/json',{signal:AbortSignal.timeout(1000)});const tabs=await response.json();if(Array.isArray(tabs))page=tabs.find(t=>t.type==='page')}catch{}
+  if(page)break;
+  await wait(50);
+ }
+ assert(page,'Chrome did not expose a debugging page within 30 seconds: '+browserLog);
+ ws=new WebSocket(page.webSocketDebuggerUrl);await new Promise(r=>ws.addEventListener('open',r));
  ws.addEventListener('message',e=>{const value=JSON.parse(e.data);if(value.id){const p=pending.get(value.id);pending.delete(value.id);value.error?p.reject(Error(value.error.message)):p.resolve(value.result)}if(value.method==='Runtime.exceptionThrown')errors.push(value.params.exceptionDetails.text)});
  await call('Runtime.enable');await call('Page.enable');await call('Emulation.setDeviceMetricsOverride',{width:1060,height:700,deviceScaleFactor:1,mobile:false});
  if(process.env.UI_PERF){

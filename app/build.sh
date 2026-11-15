@@ -11,6 +11,10 @@ assert manifest['target']=='darwin-'+os.environ['CORE_ARCH'], 'Rebuild Mihomo fo
 for name,key in [('mihomo','binary_sha256'),('geoip.metadb','geoip_sha256'),('GeoSite.dat','geosite_sha256')]:
     assert hashlib.sha256((root/name).read_bytes()).hexdigest()==manifest[key], 'Core resource checksum mismatch: '+name
 PY
+# GitHub expands unconfigured secrets to empty strings; Tauri treats presence as credentials.
+for variable in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+  [ -n "${!variable:-}" ] || unset "$variable"
+done
 export APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
 npx --yes @tauri-apps/cli@2.12.4 build --ci --target "$target" --bundles app -- --locked
 version="$(node -p 'require("./src-tauri/tauri.conf.json").version')"

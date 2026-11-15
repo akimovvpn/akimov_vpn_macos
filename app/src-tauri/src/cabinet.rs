@@ -179,7 +179,7 @@ impl Cabinet {
             .http(
                 &state.saved.base_url,
                 "POST",
-                "/auth/telegram/oidc/request",
+                "/auth/telegram/oauth/request",
                 None,
                 None,
             )
@@ -200,17 +200,13 @@ impl Cabinet {
         answer: &Value,
     ) -> Result<Value, String> {
         const REFUSED: &str = "Telegram sign-in was not completed. Try again.";
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| REFUSED)?
-            .as_secs();
-        let body = challenge.answer_body(answer, now).ok_or(REFUSED)?;
+        let body = challenge.answer_body(answer).ok_or(REFUSED)?;
         let mut state = self.lock()?;
         let tokens = self
             .http(
                 &state.saved.base_url,
                 "POST",
-                "/auth/telegram/oidc/complete",
+                "/auth/telegram/oauth/complete",
                 None,
                 Some(&body),
             )
@@ -583,8 +579,8 @@ impl Cabinet {
 
 pub struct TelegramChallenge {
     token: String,
-    nonce: String,
-    client: String,
+    state: String,
+    callback: Url,
     pub url: Url,
     pub expires: u64,
 }
@@ -593,15 +589,16 @@ impl TelegramChallenge {
     fn parse(value: &Value, site: &str) -> Option<Self> {
         let token = value["token"].as_str()?;
         let nonce = value["nonce"].as_str()?;
-        let client = match &value["client_id"] {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            _ => return None,
-        };
+        let state = value["state"].as_str()?;
+        let client = value["client_id"].as_str()?;
         let id = client.parse::<u64>().ok()?;
         let expires = value["expires_in"].as_u64()?;
         if !valid_token(token)
             || !valid_token(nonce)
+            || !valid_token(state)
+            || token == state
+            || state.len() > 256
+            || nonce.len() > 256
             || !client.bytes().all(|b| b.is_ascii_digit())
             || id == 0
             || id > 9_007_199_254_740_991
@@ -610,55 +607,81 @@ impl TelegramChallenge {
         {
             return None;
         }
-        // Matches Telegram.Login.auth's popup flow; the secret stays on the cabinet server.
-        let mut url = Url::parse("https://oauth.telegram.org/auth").ok()?;
-        url.query_pairs_mut()
-            .append_pair("response_type", "post_message")
-            .append_pair("client_id", &client)
-            .append_pair("redirect_uri", &format!("{site}/"))
-            .append_pair("origin", site)
-            .append_pair("scope", "openid profile")
-            .append_pair("nonce", nonce)
-            .append_pair("lang", "en");
+        let callback = Url::parse(&format!("{site}/auth/telegram/callback")).ok()?;
+        let url = Url::parse(value["authorization_url"].as_str()?).ok()?;
+        if url.origin().ascii_serialization() != "https://oauth.telegram.org"
+            || url.path() != "/auth"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        let mut params = std::collections::HashMap::new();
+        for (key, value) in url.query_pairs() {
+            if params
+                .insert(key.into_owned(), value.into_owned())
+                .is_some()
+            {
+                return None;
+            }
+        }
+        let required = [
+            ("response_type", "code"),
+            ("client_id", client),
+            ("redirect_uri", callback.as_str()),
+            ("scope", "openid profile"),
+            ("nonce", nonce),
+            ("state", state),
+            ("code_challenge_method", "S256"),
+        ];
+        if params.len() != 8
+            || required
+                .iter()
+                .any(|(k, v)| params.get(*k).map(String::as_str) != Some(*v))
+        {
+            return None;
+        }
+        let proof = params.get("code_challenge")?;
+        if proof.len() != 43
+            || !proof
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            return None;
+        }
         Some(Self {
             token: token.into(),
-            nonce: nonce.into(),
-            client,
+            state: state.into(),
+            callback,
             url,
             expires: expires.min(600),
         })
     }
 
     pub fn callback_url(&self) -> Url {
-        Url::parse(&format!("https://akimov-login.invalid/{}", self.nonce))
-            .expect("validated nonce")
+        self.callback.clone()
     }
 
-    fn answer_body(&self, answer: &Value, now: u64) -> Option<Value> {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        let id = answer.as_str().or_else(|| answer["id_token"].as_str())?;
-        if !valid_token(id) {
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    fn answer_body(&self, answer: &Value) -> Option<Value> {
+        let code = answer["code"].as_str()?;
+        if answer["state"].as_str() != Some(self.state.as_str()) || !valid_code(code) {
             return None;
         }
-        let parts: Vec<_> = id.split('.').collect();
-        if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
-            return None;
-        }
-        let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).ok()?).ok()?;
-        // Correlate this popup only; decoded claims grant no trust until the server verifies the JWT.
-        if claims["nonce"].as_str() != Some(self.nonce.as_str())
-            || claims["iss"] != "https://oauth.telegram.org"
-            || claims["aud"].as_str() != Some(self.client.as_str())
-            || claims["exp"].as_u64()? <= now
-        {
-            return None;
-        }
-        Some(json!({"token": self.token, "id_token": id}))
+        Some(json!({"token": self.token, "state": self.state, "code": code}))
     }
 }
 
-/// The synthetic callback is intercepted locally and must never be loaded over the network.
-pub fn telegram_callback(url: &Url, expected: &Url) -> Option<Option<String>> {
+fn valid_code(code: &str) -> bool {
+    !code.is_empty() && code.len() <= 4096 && code.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Intercept the registered callback before loading it; no authorization code reaches a web page.
+pub fn telegram_callback(url: &Url, expected: &Url, state: &str) -> Option<Option<String>> {
     if url.origin() != expected.origin()
         || url.path() != expected.path()
         || !url.username().is_empty()
@@ -667,12 +690,26 @@ pub fn telegram_callback(url: &Url, expected: &Url) -> Option<Option<String>> {
     {
         return None;
     }
-    let pairs: Vec<_> = url.query_pairs().collect();
-    match pairs.as_slice() {
-        [(key, value)] if key == "d" && !value.is_empty() && value.len() <= 32_768 => {
-            Some(Some(value.to_string()))
+    let mut params = std::collections::HashMap::new();
+    for (key, value) in url.query_pairs() {
+        if !matches!(
+            key.as_ref(),
+            "state" | "code" | "error" | "error_description"
+        ) || params
+            .insert(key.into_owned(), value.into_owned())
+            .is_some()
+        {
+            return None;
         }
-        [(key, value)] if key == "closed" && value.is_empty() => Some(None),
+    }
+    if params.get("state").map(String::as_str) != Some(state) {
+        return None;
+    }
+    match (params.get("code"), params.get("error")) {
+        (Some(code), None) if valid_code(code) && !params.contains_key("error_description") => {
+            Some(Some(json!({"state": state, "code": code}).to_string()))
+        }
+        (None, Some(error)) if !error.is_empty() => Some(None),
         _ => None,
     }
 }
@@ -958,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn telegram_answers_without_a_challenge_bound_id_token_never_reach_the_cabinet() {
+    fn telegram_answers_without_a_challenge_bound_code_never_reach_the_cabinet() {
         let dir = scratch("telegram");
         let cabinet = Cabinet::new(dir.clone());
         let challenge = telegram_challenge();
@@ -980,115 +1017,118 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn telegram_value() -> Value {
+        let mut url = Url::parse("https://oauth.telegram.org/auth").unwrap();
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", "9010497295")
+            .append_pair("redirect_uri", "https://akimov.bid/auth/telegram/callback")
+            .append_pair("scope", "openid profile")
+            .append_pair("state", "server-random-state")
+            .append_pair("nonce", "server-random-nonce")
+            .append_pair("code_challenge", &"a".repeat(43))
+            .append_pair("code_challenge_method", "S256");
+        json!({"token":"one-time-challenge", "nonce":"server-random-nonce", "state":"server-random-state", "client_id":"9010497295", "expires_in":300, "authorization_url":url.as_str()})
+    }
+
     fn telegram_challenge() -> TelegramChallenge {
-        TelegramChallenge::parse(
-            &json!({
-                "token": "one-time-challenge", "client_id": "9010497295",
-                "nonce": "server-random-nonce", "expires_in": 300,
-            }),
-            "https://akimov.bid",
-        )
-        .unwrap()
+        TelegramChallenge::parse(&telegram_value(), "https://akimov.bid").unwrap()
     }
 
     #[test]
-    fn telegram_popup_matches_the_registered_site_and_keeps_short_expiry() {
+    fn telegram_code_flow_accepts_only_the_registered_provider_and_callback() {
         let challenge = telegram_challenge();
         assert_eq!(
             challenge.url.origin().ascii_serialization(),
             "https://oauth.telegram.org"
         );
-        let params: std::collections::HashMap<_, _> = challenge.url.query_pairs().collect();
-        assert_eq!(params["client_id"], "9010497295");
-        assert_eq!(params["response_type"], "post_message");
-        assert_eq!(params["redirect_uri"], "https://akimov.bid/");
-        assert_eq!(params["origin"], "https://akimov.bid");
-        assert_eq!(params["scope"], "openid profile");
-        assert_eq!(params["nonce"], "server-random-nonce");
-        for client in [json!(null), json!(0), json!("+1"), json!("bad")] {
-            assert!(TelegramChallenge::parse(
-                &json!({"token":"token", "nonce":"nonce", "client_id":client, "expires_in":300}),
-                "https://akimov.bid"
-            )
-            .is_none());
-        }
-        let short =
-            json!({"token":"token", "nonce":"nonce", "client_id":9010497295u64, "expires_in":5});
         assert_eq!(
-            TelegramChallenge::parse(&short, "https://akimov.bid")
-                .unwrap()
-                .expires,
-            5
+            challenge.callback_url().as_str(),
+            "https://akimov.bid/auth/telegram/callback"
         );
-        assert!(TelegramChallenge::parse(&short, "https://evil.example/path").is_none());
-    }
-
-    #[test]
-    fn telegram_callback_rejects_wrong_state_origin_and_duplicate_answers() {
-        let expected = telegram_challenge().callback_url();
-        for bad in [
-            "http://akimov-login.invalid/server-random-nonce?d=answer",
-            "https://akimov-login.invalid:444/server-random-nonce?d=answer",
-            "https://user@akimov-login.invalid/server-random-nonce?d=answer",
-            "https://akimov-login.invalid/other-nonce?d=answer",
-            "https://akimov-login.invalid/server-random-nonce?d=answer&d=second",
-            "https://akimov-login.invalid/server-random-nonce?d=answer#fragment",
-            "https://akimov-login.invalid/server-random-nonce?d=",
+        assert_eq!(challenge.expires, 300);
+        for (name, replacement) in [
+            ("response_type", "post_message"),
+            ("client_id", "12345"),
+            ("state", "other-state"),
+            ("nonce", "other-nonce"),
+            ("redirect_uri", "https://evil.example/callback"),
+            ("code_challenge", "short"),
+            ("code_challenge_method", "plain"),
+            ("scope", "openid profile phone"),
         ] {
-            assert_eq!(
-                telegram_callback(&Url::parse(bad).unwrap(), &expected),
-                None,
-                "{bad}"
+            let mut value = telegram_value();
+            let mut url = Url::parse(value["authorization_url"].as_str().unwrap()).unwrap();
+            let pairs: Vec<_> = url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            url.set_query(None);
+            for (key, content) in pairs {
+                url.query_pairs_mut()
+                    .append_pair(&key, if key == name { replacement } else { &content });
+            }
+            value["authorization_url"] = url.as_str().into();
+            assert!(
+                TelegramChallenge::parse(&value, "https://akimov.bid").is_none(),
+                "{name}"
             );
         }
-        assert_eq!(
-            telegram_callback(
-                &Url::parse("https://akimov-login.invalid/server-random-nonce?d=answer").unwrap(),
-                &expected
-            ),
-            Some(Some("answer".into()))
-        );
-        assert_eq!(
-            telegram_callback(
-                &Url::parse("https://akimov-login.invalid/server-random-nonce?closed").unwrap(),
-                &expected
-            ),
-            Some(None)
-        );
+        for extra in [
+            "&client_secret=secret",
+            "&code_verifier=private",
+            "&state=server-random-state",
+            "#fragment",
+        ] {
+            let mut value = telegram_value();
+            value["authorization_url"] =
+                format!("{}{extra}", value["authorization_url"].as_str().unwrap()).into();
+            assert!(TelegramChallenge::parse(&value, "https://akimov.bid").is_none());
+        }
+        let mut value = telegram_value();
+        value["authorization_url"] = "https://evil.example/auth".into();
+        assert!(TelegramChallenge::parse(&value, "https://akimov.bid").is_none());
     }
 
     #[test]
-    fn telegram_id_token_is_correlated_before_server_signature_verification() {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    fn telegram_callback_requires_matching_state_and_unambiguous_code() {
         let challenge = telegram_challenge();
-        let claims = json!({"iss":"https://oauth.telegram.org", "aud":"9010497295", "nonce":"server-random-nonce", "exp":2000});
-        // Unsigned fixtures test correlation only: the server must always verify the real signature.
-        let id = |claims: &Value| {
-            format!(
-                "e30.{}.signature",
-                URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap())
-            )
-        };
-        let token = id(&claims);
+        let expected = challenge.callback_url();
+        for bad in [
+            "http://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc",
+            "https://evil.example/auth/telegram/callback?state=server-random-state&code=abc",
+            "https://user@akimov.bid/auth/telegram/callback?state=server-random-state&code=abc",
+            "https://akimov.bid/other?state=server-random-state&code=abc",
+            "https://akimov.bid/auth/telegram/callback?state=other&code=abc",
+            "https://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc&code=def",
+            "https://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc&error=denied",
+            "https://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc#fragment",
+            "https://akimov.bid/auth/telegram/callback?state=server-random-state&code=",
+        ] { assert_eq!(telegram_callback(&Url::parse(bad).unwrap(),&expected,"server-random-state"),None,"{bad}"); }
+        let answer=telegram_callback(&Url::parse("https://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc%2F%2B%3D").unwrap(),&expected,"server-random-state").unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&answer).unwrap(),
+            json!({"state":"server-random-state","code":"abc/+="})
+        );
+        assert_eq!(telegram_callback(&Url::parse("https://akimov.bid/auth/telegram/callback?state=server-random-state&error=access_denied").unwrap(),&expected,"server-random-state"),Some(None));
+    }
+
+    #[test]
+    fn telegram_completion_sends_only_code_state_and_private_request_token() {
+        let challenge = telegram_challenge();
         assert_eq!(
             challenge
-                .answer_body(&json!({"id_token":token}), 1000)
+                .answer_body(&json!({"state":"server-random-state","code":"abc/+="}))
                 .unwrap(),
-            json!({"token":"one-time-challenge", "id_token":token})
+            json!({"token":"one-time-challenge","state":"server-random-state","code":"abc/+="})
         );
-        assert!(challenge.answer_body(&json!(id(&claims)), 2000).is_none());
-        for (field, value) in [
-            ("iss", json!("https://evil.example")),
-            ("aud", json!("other-client")),
-            ("nonce", json!("other-login")),
-            ("nonce", Value::Null),
+        for answer in [
+            json!({"state":"wrong","code":"abc"}),
+            json!({"state":"server-random-state","code":""}),
+            json!({"id_token":"legacy-token"}),
+            json!({"state":"server-random-state","code":"abc\r\n"}),
         ] {
-            let mut wrong = claims.clone();
-            wrong[field] = value;
-            assert!(
-                challenge.answer_body(&json!(id(&wrong)), 1000).is_none(),
-                "{field}"
-            );
+            assert!(challenge.answer_body(&answer).is_none());
         }
     }
 

@@ -38,20 +38,6 @@ fn cabinet_login(
     forgotten?;
     Ok(result)
 }
-/// Runs inside Telegram's page, in a window that cannot call any app command. Telegram's page
-/// answers the page that opened it; here that answer is carried out as a navigation the app stops.
-const TELEGRAM_BRIDGE: &str = r#"(function(){
-  if(window.top!==window||location.origin!=="https://oauth.telegram.org")return;
-  var sent=false;
-  function done(data){
-    if(sent)return;sent=true;
-    location.href="__AKIMOV_CALLBACK__?"+(data===undefined?"closed":"d="+encodeURIComponent(typeof data==="string"?data:JSON.stringify(data)));
-  }
-  var opener={closed:false,focus:function(){},postMessage:function(data,target){if(target==="__AKIMOV_ORIGIN__")done(data)}};
-  try{Object.defineProperty(window,"opener",{configurable:true,get:function(){return opener},set:function(){}})}catch(e){}
-  window.close=function(){done()};
-})();"#;
-
 /// Telegram's official sign-in, the same one the cabinet uses, in its own window.
 /// Returns the account, or null when the window was closed without signing in.
 #[tauri::command(async)]
@@ -70,9 +56,7 @@ fn cabinet_telegram_login(
     let (done, answers) = std::sync::mpsc::channel::<Option<String>>();
     let closed = done.clone();
     let callback = challenge.callback_url();
-    let bridge = TELEGRAM_BRIDGE
-        .replace("__AKIMOV_CALLBACK__", callback.as_str())
-        .replace("__AKIMOV_ORIGIN__", "https://akimov.bid");
+    let state = challenge.state().to_owned();
     let window = tauri::WebviewWindowBuilder::new(
         &app,
         "telegram",
@@ -81,10 +65,9 @@ fn cabinet_telegram_login(
     .title("Sign in with Telegram")
     .inner_size(520.0, 720.0)
     .center()
-    .initialization_script(&bridge)
     .on_navigation(move |url| {
-        if url.host_str() == Some("akimov-login.invalid") {
-            if let Some(answer) = cabinet::telegram_callback(url, &callback) {
+        if url.origin() == callback.origin() && url.path() == callback.path() {
+            if let Some(answer) = cabinet::telegram_callback(url, &callback, &state) {
                 let _ = done.send(answer);
             }
             return false;
@@ -108,11 +91,8 @@ fn cabinet_telegram_login(
         return Ok(Value::Null);
     };
     let message: Value = serde_json::from_str(&answer).map_err(|_| REFUSED)?;
-    if message["event"] != "auth_result" || !message["error"].is_null() {
-        return Err(REFUSED.into());
-    }
     let _guard = gate.0.lock().map_err(|_| "Account operation failed.")?;
-    let me = c.telegram_complete(&challenge, &message["result"])?;
+    let me = c.telegram_complete(&challenge, &message)?;
     let stopped = e.disconnect();
     let forgotten = e.forget_subscription();
     stopped?;
