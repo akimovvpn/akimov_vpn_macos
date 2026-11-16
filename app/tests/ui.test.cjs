@@ -11,7 +11,7 @@ function element() {
   return {dataset:{},style:{setProperty(){}},classList:classes(),children:[],innerHTML:'',textContent:'',hidden:false,isConnected:true,offsetWidth:1060,clientWidth:340,
     setAttribute(){},getAttribute(){return null},removeAttribute(){},focus(){},select(){},append(){},prepend(){},remove(){this.isConnected=false},
     getBoundingClientRect:()=>({left:0,top:0,width:10,height:10}),querySelector:query,querySelectorAll:()=>[],matches:()=>false,contains:()=>false,
-    animate(){},getAnimations:()=>[],addEventListener(){},getContext:()=>({scale(){},setTransform(){},clearRect(){draws++},stroke(){},beginPath(){},arc(){},fill(){},getImageData(){const data=new Uint8Array(256*256*4);data[3]=255;return {data}}})};
+    animate(){},getAnimations:()=>[],addEventListener(){},getContext:()=>({scale(){},setTransform(){},clearRect(){draws++},stroke(){},beginPath(){},moveTo(){},arc(){},fill(){},getImageData(){const data=new Uint8Array(256*256*4);data[3]=255;return {data}}})};
 }
 function query(selector) {if(!nodes.has(selector))nodes.set(selector,element());return nodes.get(selector)}
 const me = {id:1,email:'fixture@example.invalid',balance:100000,discount:{percent:7},payment_methods:[{id:'yookassa',name:'Cards',fee_percent:5}],subscriptions:[
@@ -78,7 +78,7 @@ const flush = () => new Promise(resolve=>setImmediate(resolve));
   assert(run('PT.every((p,i)=>p.init&&Number.isFinite(p.x)&&Math.abs(p.x-(170+MP[i][0]*340*.92+Math.sin(T*1.3+p.ph)*.7))<.001)'),'connected particles settle into the sampled logo');
   motion.matches=false;motion.change();draws=0;
   for(let i=0;i<240;i++)advance(24+i*1000/120);
-  assert(draws>=59&&draws<=61,'ProMotion draws at 30 fps: '+draws);assert.equal(frames.size,1,'only one animation loop can run');
+  assert(draws>=239&&draws<=241,'ProMotion draws on every 120 Hz refresh: '+draws);assert.equal(frames.size,1,'only one animation loop can run');
   run('startAnimation();startAnimation()');assert.equal(frames.size,1);
   run('S.screen="account";startAnimation()');assert.equal(frames.size,0,'leaving Home cancels the pending frame');
   run('S.screen="home";startAnimation()');document.hidden=true;advance(now+17);assert.equal(frames.size,0,'hidden windows stop drawing');document.hidden=false;

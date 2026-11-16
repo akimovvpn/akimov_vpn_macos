@@ -19,12 +19,13 @@ dependencies = [
 
 [[package]]
 name = "akimov-vpn"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "base64 0.22.1",
  "core-foundation",
  "libc",
  "native-tls",
+ "objc2",
  "regex",
  "security-framework",
  "serde",

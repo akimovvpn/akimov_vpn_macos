@@ -209,16 +209,20 @@ function resample(){
   const d=g.getImageData(0,0,256,256).data,pts=[];for(let y=0;y<256;y+=2)for(let x=0;x<256;x+=2)if(d[(y*256+x)*4+3]>128)pts.push([x/256-.5,y/256-.5]);
   MP=PT.map(()=>pts[Math.floor(Math.random()*pts.length)]);
 }
+// Dots are grouped by colour and quantized alpha so a frame is ~a dozen fills, not one per dot.
+const LV=12,BK=Array.from({length:LV*2},()=>[]);
 function dust(g,W,dt){
   const c=W/2,R=W*.37,st=S.conn,still=reduced(),k=1-Math.exp(-dt*(st==="connected"?4.5:st==="connecting"?6:3));
+  for(const b of BK)b.length=0;
   PT.forEach((p,i)=>{
     let tx,ty,al;
     if(st==="connected"){const m=MP[i];tx=c+m[0]*W*.92+Math.sin(T*1.3+p.ph)*.7;ty=c+m[1]*W*.92+Math.cos(T*1.1+p.ph)*.7;al=.5+.5*Math.sin(T*1.8+p.ph)**2}
     else if(st==="connecting"){const a=p.a+T*2.6;tx=c+Math.cos(a)*R*(.84+.1*Math.sin(p.ph));ty=c+Math.sin(a)*R*(.84+.1*Math.sin(p.ph));al=.85}
     else{const a=p.a+T*.14*(1.5-p.r*.5),dx=Math.cos(a)*R*p.r,dy=Math.sin(a)*R*p.r*.34+(p.z-.5)*9;tx=c+dx*.951+dy*.309;ty=c-dx*.309+dy*.951;al=(.18+.6*(.5+.5*Math.sin(a)))*(st==="blocked"?.55:1)}
     if(!p.init||still){p.x=tx;p.y=ty;p.init=true}else{p.x+=(tx-p.x)*k;p.y+=(ty-p.y)*k}
-    g.globalAlpha=al;g.fillStyle=st==="connected"&&p.s>1.25?ACC:INK;g.beginPath();g.arc(p.x,p.y,st==="connected"?p.s*.8:p.s,0,6.2832);g.fill();
+    p.rr=st==="connected"?p.s*.8:p.s;BK[(st==="connected"&&p.s>1.25?LV:0)+Math.min(LV-1,Math.round(al*(LV-1)))].push(p);
   });
+  BK.forEach((b,j)=>{if(!b.length)return;g.globalAlpha=(j%LV)/(LV-1);g.fillStyle=j<LV?INK:ACC;g.beginPath();for(const p of b){g.moveTo(p.x+p.rr,p.y);g.arc(p.x,p.y,p.rr,0,6.2832)}g.fill()});
 }
 let amp=0;
 function ticks(g,W){
@@ -235,14 +239,13 @@ function ticks(g,W){
 let T=0,lastT=performance.now(),frameHandle=0;
 function startAnimation(){
   if(!S.signed_in||document.hidden||S.screen!=="home"){cancelAnimationFrame(frameHandle);frameHandle=0;return}
-  if(!frameHandle){lastT=performance.now()-1000/30;frameHandle=requestAnimationFrame(frame)}
+  if(!frameHandle){lastT=performance.now()-1000/60;frameHandle=requestAnimationFrame(frame)}
 }
 function frame(now){
   frameHandle=0;if(!S.signed_in||document.hidden||S.screen!=="home")return;
   const cv=$("#cv");if(!cv)return;
   const still=reduced();if(!still)frameHandle=requestAnimationFrame(frame);
-  // Keep decorative drawing at 30 fps, including on ProMotion displays.
-  if(!still&&now-lastT<1000/30-1)return;
+  // Draw on every display refresh (up to 120 Hz on ProMotion); motion is time-based, so any rate looks the same.
   const dt=Math.min(.05,(now-lastT)/1000);lastT=now;if(!still)T+=dt;
   const W=cv.clientWidth,dpr=Math.min(2,devicePixelRatio||1);if(!W)return;if(cv.width!==Math.round(W*dpr))cv.width=cv.height=Math.round(W*dpr);
   const g=cv.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,W);
@@ -375,16 +378,21 @@ function renderSide(){
 }
 function render(){
   root.dataset.auth=S.restoring?"restoring":S.signed_in?"signed-in":"signed-out";$("#logo").disabled=S.restoring||!S.signed_in;
-  const screen=S.signed_in?S.screen:"account",m=$("#main");m.innerHTML=S.restoring?"":screens[screen]();startAnimation();
-  [...m.children].forEach((c,i)=>c.style.setProperty("--k",i));
-  $$(".stag",m).forEach(s=>[...s.children].forEach((c,i)=>c.style.setProperty("--k",Math.min(i,9)+1)));
+  const screen=S.signed_in?S.screen:"account",m=$("#main"),html=S.restoring?"":screens[screen](),key=html+!!S.deviceBusy;
+  // Background refreshes usually bring the same data: keep the DOM so nothing reflows, reloads or restarts its animation.
+  const same=key===lastHTML&&screen!=="conns"&&m.childElementCount>0;
+  if(!same){m.innerHTML=html;lastHTML=key;
+    [...m.children].forEach((c,i)=>c.style.setProperty("--k",i));
+    $$(".stag",m).forEach(s=>[...s.children].forEach((c,i)=>c.style.setProperty("--k",Math.min(i,9)+1)))}
+  startAnimation();
   if(S.signed_in&&screen==="home"){setConn(S.conn);renderSide()}
   if(S.signed_in&&screen==="conns"&&S.conn==="connected"){connEls.clear();syncConns(true)}
   if(S.signed_in&&screen==="rules")showMsg();
   if(S.deviceBusy)for(const control of $$('[data-act^="dev-"],[data-act="switch"],[data-act="switch-ok"]',m))control.disabled=true;
   settle(m);S.just=null;
-  const f=$("#editv")||$("#devname");if(f){f.focus();f.select()}
+  const f=!same&&($("#editv")||$("#devname"));if(f){f.focus();f.select()}
 }
+let lastHTML="";
 /* same-screen update: no screen animation, rows glide instead */
 function rr(){const m=$("#main");m.classList.remove("enter","leave");const s=snap();render();play(s)}
 let enT=0,pendingPaint=null;const entered=()=>{clearTimeout(enT);enT=setTimeout(()=>{$("#main").classList.remove("enter");const screen=pendingPaint;pendingPaint=null;if(screen===S.screen)paintScreen(screen)},200)};

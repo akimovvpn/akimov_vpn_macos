@@ -47,7 +47,7 @@ async function screenshot(name){const r=await call('Page.captureScreenshot',{for
   measurements.navigationMs=await evaluate(`new Promise(resolve=>{const start=performance.now();go('settings');const check=()=>document.querySelector('#main>.head')?.textContent.includes('Settings')?resolve(Math.round(performance.now()-start)):requestAnimationFrame(check);check()})`);
   measurements.backdropSurfaces=await evaluate(`[...document.querySelectorAll('.card,.sheet,.tbtn')].filter(el=>getComputedStyle(el).backdropFilter!=='none').length`);
   if(process.env.UI_PERF!=='before'){
-   for(const state of ['idle','connected']){assert(measurements[state].arcs>0&&measurements[state].arcs<=23040,'Home stays within its 30 fps particle budget');assert.equal(measurements[state].media,0)}
+   for(const state of ['idle','connected']){assert(measurements[state].arcs>0&&measurements[state].arcs<=45000,'Home draws each refresh within its particle budget');assert(measurements[state].fills<=measurements[state].frames*24,'particles are batched into a few fills per frame');assert.equal(measurements[state].media,0)}
    for(const state of ['account','reduced']){assert.equal(measurements[state].arcs,0);assert.equal(measurements[state].frames,0)}
    assert.equal(measurements.backdropSurfaces,0,'scrolling surfaces do not blur their backdrops');
   }
@@ -60,6 +60,7 @@ async function screenshot(name){const r=await call('Page.captureScreenshot',{for
  await evaluate('S.screen="subs";rr()');await wait(400);
  const two=await evaluate(`(()=>{const cards=[...document.querySelectorAll('.plan')],box=document.querySelector('.cards').getBoundingClientRect();return {width:box.width,cards:cards.map(c=>({width:c.getBoundingClientRect().width,overflow:c.scrollWidth>c.clientWidth+1})),choose:cards[1].innerText.includes('Choose a plan')}})()`);
  assert.equal(two.cards.length,2);assert(Math.abs(two.cards[0].width-two.cards[1].width)<1);assert(two.cards.every(c=>!c.overflow));assert.equal(two.choose,false);await screenshot('plans-two');
+ assert.deepEqual(await evaluate('(()=>{const first=()=>document.querySelector("#main").firstElementChild,a=first();render();const kept=a===first();S.deviceBusy=true;render();const busy=a!==first();S.deviceBusy=false;render();return [kept,busy]})()'),[true,true],'identical refreshes keep the DOM; busy state still re-renders');
  await evaluate('S.subs.splice(0,1);rr()');await wait(400);
  assert(await evaluate('Math.abs(document.querySelector(".plan").getBoundingClientRect().width-document.querySelector(".cards").getBoundingClientRect().width)<1'));await screenshot('plans-one');
  await evaluate('S.screen="account";rr();window.screenEntries=0;document.addEventListener("animationstart",e=>{if(e.animationName==="enm"&&e.target.matches("#main>.head"))window.screenEntries++});go("settings");refreshScreen("settings")');await wait(1400);

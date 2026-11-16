@@ -1,6 +1,6 @@
 [package]
 name = "akimov-vpn"
-version = "1.0.14"
+version = "1.0.15"
 edition = "2021"
 description = "akimov vpn for macOS"
 
@@ -27,6 +27,8 @@ libc = "0.2"
 core-foundation = "0.10"
 security-framework = "3"
 tauri-plugin-single-instance = "2"
+# Already used by Tauri's WebKit layer; lets the window lift WebKit's 60 fps rendering preference.
+objc2 = "0.6"
 
 [profile.release]
 opt-level = "s"

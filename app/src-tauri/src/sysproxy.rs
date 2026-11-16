@@ -25,6 +25,83 @@ extern "C" {
     fn SCPreferencesPathRemoveValue(prefs: PrefsRef, path: CFStringRef) -> u8;
     fn SCPreferencesCommitChanges(prefs: PrefsRef) -> u8;
     fn SCPreferencesApplyChanges(prefs: PrefsRef) -> u8;
+    fn SCDynamicStoreCreate(
+        allocator: CFTypeRef,
+        name: CFStringRef,
+        callout: *const std::ffi::c_void,
+        context: *const std::ffi::c_void,
+    ) -> PrefsRef;
+    fn SCDynamicStoreCopyValue(store: PrefsRef, key: CFStringRef) -> CFTypeRef;
+    fn SCDynamicStoreSetValue(store: PrefsRef, key: CFStringRef, value: CFTypeRef) -> u8;
+    fn SCDynamicStoreRemoveValue(store: PrefsRef, key: CFStringRef) -> u8;
+}
+/// The live network state. Another VPN can publish a primary service that exists only here,
+/// and macOS then takes the global proxy from that service's State: entry, never from Wi-Fi.
+struct Store(PrefsRef);
+impl Store {
+    fn new() -> Result<Self, String> {
+        let name = CFString::new("akimov vpn");
+        let ptr = unsafe {
+            SCDynamicStoreCreate(
+                std::ptr::null(),
+                name.as_concrete_TypeRef(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if ptr.is_null() {
+            return Err("macOS network state is unavailable.".into());
+        }
+        Ok(Self(ptr))
+    }
+    fn get(&self, key: &str) -> Option<Dict> {
+        let key = CFString::new(key);
+        let ptr = unsafe { SCDynamicStoreCopyValue(self.0, key.as_concrete_TypeRef()) };
+        if ptr.is_null() {
+            return None;
+        }
+        unsafe { CFType::wrap_under_create_rule(ptr) }
+            .downcast::<CFDictionary>()
+            .map(|dict| unsafe { Dict::wrap_under_get_rule(dict.as_concrete_TypeRef()) })
+    }
+    fn put(&self, key: &str, value: Option<&Dict>) -> Result<(), String> {
+        let key = CFString::new(key);
+        let ok = unsafe {
+            match value {
+                Some(dict) => {
+                    SCDynamicStoreSetValue(self.0, key.as_concrete_TypeRef(), dict.as_CFTypeRef())
+                }
+                None => SCDynamicStoreRemoveValue(self.0, key.as_concrete_TypeRef()),
+            }
+        };
+        if ok == 0 {
+            Err("Could not change macOS network state.".into())
+        } else {
+            Ok(())
+        }
+    }
+    /// A primary service missing from the saved preferences belongs to another app's tunnel.
+    fn foreign_primary(&self, saved: &BTreeMap<String, CFType>) -> Option<String> {
+        let ipv4 = self.get("State:/Network/Global/IPv4")?;
+        let id = fields(&ipv4)
+            .get("PrimaryService")?
+            .downcast::<CFString>()?
+            .to_string();
+        (valid_id(&id) && !saved.contains_key(&id)).then_some(id)
+    }
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0) }
+    }
+}
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+fn state_key(path: &str) -> bool {
+    path.strip_prefix("State:/Network/Service/")
+        .and_then(|p| p.strip_suffix("/Proxies"))
+        .is_some_and(valid_id)
 }
 struct Prefs(PrefsRef);
 impl Prefs {
@@ -134,6 +211,9 @@ fn decode(bytes: &[u8]) -> Result<Dict, String> {
 #[derive(Serialize, Deserialize)]
 pub struct Backup {
     changes: Vec<Change>,
+    // Older recovery records have no live-state changes.
+    #[serde(default)]
+    state: Vec<Change>,
 }
 #[derive(Serialize, Deserialize)]
 struct Change {
@@ -191,9 +271,26 @@ pub fn apply_root(port: Option<u16>, recovery: &Path) -> Result<Backup, String> 
         .ok_or("No macOS network services were found.")?;
     let mut backup = Backup {
         changes: Vec::new(),
+        state: Vec::new(),
     };
-    for id in fields(&services).keys() {
-        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+    let saved = fields(&services);
+    let store = Store::new()?;
+    // shortcut: checked once at connect; a VPN that becomes primary later wins until reconnect. Watch the store if that matters.
+    if port.is_some() {
+        if let Some(id) = store.foreign_primary(&saved) {
+            let path = format!("State:/Network/Service/{id}/Proxies");
+            let before = store.get(&path);
+            let mut values = before.as_ref().map(fields).unwrap_or_default();
+            proxy_values(&mut values, port);
+            backup.state.push(Change {
+                path,
+                before: before.as_ref().map(encode).transpose()?,
+                installed: encode(&dictionary(values))?,
+            });
+        }
+    }
+    for id in saved.keys() {
+        if !valid_id(id) {
             return Err("Invalid network service identifier.".into());
         }
         let path = format!(
@@ -202,26 +299,7 @@ pub fn apply_root(port: Option<u16>, recovery: &Path) -> Result<Backup, String> 
         );
         let before = prefs.get(&path);
         let mut values = before.as_ref().map(fields).unwrap_or_default();
-        if let Some(port) = port {
-            for prefix in ["HTTP", "HTTPS", "SOCKS"] {
-                values.insert(format!("{prefix}Enable"), CFNumber::from(1i32).as_CFType());
-                values.insert(
-                    format!("{prefix}Proxy"),
-                    CFString::new("127.0.0.1").as_CFType(),
-                );
-                values.insert(
-                    format!("{prefix}Port"),
-                    CFNumber::from(i32::from(port)).as_CFType(),
-                );
-            }
-            for key in ["ProxyAutoConfigEnable", "ProxyAutoDiscoveryEnable"] {
-                values.insert(key.into(), CFNumber::from(0i32).as_CFType());
-            }
-        } else {
-            let servers =
-                CFArray::from_CFTypes(&[CFString::new("1.1.1.1"), CFString::new("8.8.8.8")]);
-            values.insert("ServerAddresses".into(), servers.as_CFType());
-        }
+        proxy_values(&mut values, port);
         backup.changes.push(Change {
             path,
             before: before.as_ref().map(encode).transpose()?,
@@ -243,7 +321,11 @@ pub fn apply_root(port: Option<u16>, recovery: &Path) -> Result<Backup, String> 
         for change in &backup.changes {
             prefs.put(&change.path, Some(&decode(&change.installed)?))?;
         }
-        prefs.commit()
+        prefs.commit()?;
+        for change in &backup.state {
+            store.put(&change.path, Some(&decode(&change.installed)?))?;
+        }
+        Ok(())
     })();
     drop(prefs);
     if let Err(error) = result {
@@ -251,6 +333,34 @@ pub fn apply_root(port: Option<u16>, recovery: &Path) -> Result<Backup, String> 
         return Err(error);
     }
     Ok(backup)
+}
+fn proxy_values(values: &mut BTreeMap<String, CFType>, port: Option<u16>) {
+    if let Some(port) = port {
+        for prefix in ["HTTP", "HTTPS", "SOCKS"] {
+            values.insert(format!("{prefix}Enable"), CFNumber::from(1i32).as_CFType());
+            values.insert(
+                format!("{prefix}Proxy"),
+                CFString::new("127.0.0.1").as_CFType(),
+            );
+            values.insert(
+                format!("{prefix}Port"),
+                CFNumber::from(i32::from(port)).as_CFType(),
+            );
+        }
+        for key in ["ProxyAutoConfigEnable", "ProxyAutoDiscoveryEnable"] {
+            values.insert(key.into(), CFNumber::from(0i32).as_CFType());
+        }
+    } else {
+        let servers = CFArray::from_CFTypes(&[CFString::new("1.1.1.1"), CFString::new("8.8.8.8")]);
+        values.insert("ServerAddresses".into(), servers.as_CFType());
+    }
+}
+/// The restored value, or None to remove an entry that did not exist before.
+fn restored(current: &Dict, change: &Change) -> Result<Option<Dict>, String> {
+    let before = change.before.as_deref().map(decode).transpose()?;
+    let installed = decode(&change.installed)?;
+    let restored = restore_fields(current, before.as_ref(), &installed);
+    Ok((!restored.is_empty() || before.is_some()).then_some(restored))
 }
 pub fn restore_root(backup: &Backup, recovery: &Path) -> Result<(), String> {
     let prefs = Prefs::new()?;
@@ -261,16 +371,18 @@ pub fn restore_root(backup: &Backup, recovery: &Path) -> Result<(), String> {
         let Some(current) = prefs.get(&change.path) else {
             continue;
         };
-        let before = change.before.as_deref().map(decode).transpose()?;
-        let installed = decode(&change.installed)?;
-        let restored = restore_fields(&current, before.as_ref(), &installed);
-        if restored.is_empty() && before.is_none() {
-            prefs.put(&change.path, None)?;
-        } else {
-            prefs.put(&change.path, Some(&restored))?;
-        }
+        prefs.put(&change.path, restored(&current, change)?.as_ref())?;
     }
     prefs.commit()?;
+    let store = Store::new()?;
+    for change in &backup.state {
+        if !state_key(&change.path) {
+            return Err("Invalid network recovery path.".into());
+        }
+        if let Some(current) = store.get(&change.path) {
+            store.put(&change.path, restored(&current, change)?.as_ref())?;
+        }
+    }
     match std::fs::remove_file(recovery) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result.map_err(|e| e.to_string()),
@@ -332,5 +444,39 @@ mod tests {
         assert_eq!(restored["HTTPPort"], CFNumber::from(9999i32).as_CFType());
         assert_eq!(restored["HTTPEnable"], CFNumber::from(1i32).as_CFType());
         assert!(restore_fields(&installed, None, &installed).is_empty());
+    }
+    #[test]
+    fn live_state_recovery_is_limited_to_service_proxies_and_old_records_still_load() {
+        assert!(state_key(
+            "State:/Network/Service/B1E2D3A4-0F6C-4A8E-9D7B-48415050544E/Proxies"
+        ));
+        for path in [
+            "State:/Network/Global/Proxies",
+            "State:/Network/Service//Proxies",
+            "State:/Network/Service/../Proxies",
+            "State:/Network/Service/A/DNS",
+            "Setup:/Network/Service/A/Proxies",
+        ] {
+            assert!(!state_key(path), "{path}");
+        }
+        let old: Backup = serde_json::from_str(r#"{"changes":[]}"#).unwrap();
+        assert!(old.state.is_empty());
+        // A key we created is removed again; one that existed gets its old fields back.
+        let ours = dictionary(BTreeMap::from([(
+            "HTTPEnable".into(),
+            CFNumber::from(1i32).as_CFType(),
+        )]));
+        let created = Change {
+            path: String::new(),
+            before: None,
+            installed: encode(&ours).unwrap(),
+        };
+        assert!(restored(&ours, &created).unwrap().is_none());
+        let empty = dictionary(BTreeMap::new());
+        let existed = Change {
+            before: Some(encode(&empty).unwrap()),
+            ..created
+        };
+        assert!(restored(&ours, &existed).unwrap().unwrap().is_empty());
     }
 }

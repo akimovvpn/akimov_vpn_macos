@@ -341,6 +341,41 @@ fn watch(e: Eng, on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// WebKit keeps page rendering near 60 fps by default; ProMotion displays can refresh at 120 Hz.
+/// The flag is WebKit's own feature switch (the one Safari exposes); older WebKit without it is left as is.
+unsafe fn full_frame_rate(webview: *mut std::ffi::c_void) {
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2::{msg_send, sel};
+    let Some(class) = AnyClass::get(c"WKPreferences") else {
+        return;
+    };
+    let webview = webview.cast::<AnyObject>();
+    // `_features` is a class method, so ask the class object itself.
+    let listed: Bool = msg_send![class, respondsToSelector: sel!(_features)];
+    if webview.is_null() || !listed.as_bool() {
+        return;
+    }
+    let config: *mut AnyObject = msg_send![webview, configuration];
+    let prefs: *mut AnyObject = msg_send![config, preferences];
+    let features: *mut AnyObject = msg_send![class, _features];
+    let settable: Bool = msg_send![prefs, respondsToSelector: sel!(_setEnabled:forFeature:)];
+    if prefs.is_null() || features.is_null() || !settable.as_bool() {
+        return;
+    }
+    let count: usize = msg_send![features, count];
+    for i in 0..count {
+        let feature: *mut AnyObject = msg_send![features, objectAtIndex: i];
+        let key: *mut AnyObject = msg_send![feature, key];
+        let name: *const std::ffi::c_char = msg_send![key, UTF8String];
+        if !name.is_null()
+            && std::ffi::CStr::from_ptr(name).to_bytes()
+                == b"PreferPageRenderingUpdatesNear60FPSEnabled"
+        {
+            let _: () = msg_send![prefs, _setEnabled: Bool::NO, forFeature: feature];
+        }
+    }
+}
+
 fn main() {
     if let Some(result) = service::early_main() {
         if let Err(error) = result {
@@ -388,6 +423,9 @@ fn main() {
         ])
         .setup(|app| {
             build_tray(app)?;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.with_webview(|webview| unsafe { full_frame_rate(webview.inner()) });
+            }
             Ok(())
         })
         // closing the window hides it to the tray by default; with that setting off it quits:

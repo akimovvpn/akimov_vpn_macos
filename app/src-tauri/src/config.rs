@@ -396,6 +396,8 @@ pub fn build(
         dns["fake-ip-range"] = Value::from("198.19.0.1/16");
     }
     out.insert("dns".into(), dns);
+    // Browsers on DoH send bare IPs; the SNI lets domain rules still match. Routing only, the destination is kept.
+    out.insert("sniffer".into(), serde_yaml::from_str("enable: true\nforce-dns-mapping: true\nparse-pure-ip: true\noverride-destination: false\nsniff: {HTTP: {ports: [80, 8080-8880]}, TLS: {ports: [443, 8443]}, QUIC: {ports: [443, 8443]}}\nskip-domain: ['+.push.apple.com']\n").map_err(|e| e.to_string())?);
     let mut tunnel: Value = serde_yaml::from_str(if tun {
         "enable: true\ndevice: utun\nstack: mixed\nauto-route: true\nauto-detect-interface: true\nstrict-route: true\nmtu: 1500\ninet6-address: ['fdfe:dcba:9877::1/126']\ndns-hijack: ['any:53', 'tcp://any:53']\n"
     } else { "enable: false" }).map_err(|e| e.to_string())?;
@@ -886,6 +888,11 @@ mod tests {
         assert_eq!(v["ipv6"].as_bool(), Some(true));
         assert_eq!(v["dns"]["enable"].as_bool(), Some(true));
         assert_eq!(v["dns"]["enhanced-mode"].as_str(), Some("fake-ip"));
+        // Domain rules must still match when a browser resolves names itself.
+        assert_eq!(v["sniffer"]["enable"].as_bool(), Some(true));
+        assert_eq!(v["sniffer"]["parse-pure-ip"].as_bool(), Some(true));
+        assert_eq!(v["sniffer"]["override-destination"].as_bool(), Some(false));
+        assert!(v["sniffer"]["sniff"]["TLS"]["ports"].is_sequence());
     }
 
     #[test]
