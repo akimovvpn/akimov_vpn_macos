@@ -221,15 +221,19 @@ impl Cabinet {
             return Ok(json!({"status": "expired"}));
         }
         let body = json!({"token": request.token});
-        let value = self
-            .http(
-                &state.saved.base_url,
-                "POST",
-                "/auth/oauth/poll",
-                None,
-                Some(&body),
-            )
-            .map_err(|e| e.message)?;
+        let value = self.http(
+            &state.saved.base_url,
+            "POST",
+            "/auth/oauth/poll",
+            None,
+            Some(&body),
+        );
+        let value = match value {
+            Ok(value) => value,
+            // A dropped connection or the poll limit: keep waiting; the deadline still ends it.
+            Err(e) if e.status == 0 || e.status == 429 => return Ok(json!({"status": "pending"})),
+            Err(e) => return Err(e.message),
+        };
         match value["status"].as_str() {
             Some("pending") => return Ok(json!({"status": "pending"})),
             Some("confirmed") => {}
@@ -272,10 +276,13 @@ impl Cabinet {
                 if body["accept_terms"] != true || body["accept_personal_data"] != true {
                     return Err("Please accept both agreements to create an account.".into());
                 }
-                if state.ticket.is_empty() {
+                // The server uses the ticket up on any attempt, so it is never sent twice.
+                let ticket = std::mem::take(&mut state.ticket);
+                if ticket.is_empty() {
                     return Err(SIGNUP_EXPIRED.into());
                 }
-                let request = json!({"ticket": state.ticket, "accept_terms": true, "accept_personal_data": true});
+                let request =
+                    json!({"ticket": ticket, "accept_terms": true, "accept_personal_data": true});
                 ("/auth/email/create", request)
             }
             "email-code" | "email-verify" => return Err("Enter a valid email address.".into()),
@@ -596,7 +603,7 @@ impl OAuthRequest {
             || state.len() > 512
             || confirm.len() != 4
             || !confirm.bytes().all(|b| b.is_ascii_digit())
-            || !(1..=300).contains(&expires)
+            || expires == 0
             || origin(site, false).ok()?.as_str() != site
         {
             return None;
@@ -647,8 +654,8 @@ impl OAuthRequest {
             token: token.into(),
             confirm: confirm.into(),
             url,
-            expires,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(expires),
+            expires: expires.min(300),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(expires.min(300)),
         })
     }
 }
@@ -1027,7 +1034,6 @@ mod tests {
                 json!({"state":"one-time-request"}),
                 json!({"token":"bad token"}),
                 json!({"expires_in":0}),
-                json!({"expires_in":301}),
             ] {
                 let mut value = oauth_value(provider);
                 for (k, v) in patch.as_object().unwrap() {
@@ -1041,6 +1047,13 @@ mod tests {
             assert!(
                 OAuthRequest::parse(provider, &oauth_value(provider), "https://other.example")
                     .is_none()
+            );
+            let mut longer = oauth_value(provider);
+            longer["expires_in"] = json!(600);
+            let capped = OAuthRequest::parse(provider, &longer, "https://akimov.bid").unwrap();
+            assert_eq!(
+                capped.expires, 300,
+                "a longer server timeout is capped, not refused"
             );
         }
         assert!(
@@ -1059,6 +1072,25 @@ mod tests {
         cabinet.oauth_cancel();
         assert_eq!(cabinet.oauth_poll().unwrap()["status"], "expired");
         assert!(cabinet.oauth_start("github").is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oauth_poll_rides_out_a_network_blip() {
+        let dir = scratch("oauth-blip");
+        let cabinet = Cabinet::new(dir.clone());
+        {
+            let mut state = cabinet.lock().unwrap();
+            let request =
+                OAuthRequest::parse("google", &oauth_value("google"), "https://akimov.bid");
+            state.oauth = request;
+            state.saved.base_url = "https://127.0.0.1:9/api/v1".into();
+        }
+        assert_eq!(cabinet.oauth_poll().unwrap()["status"], "pending");
+        assert!(
+            cabinet.lock().unwrap().oauth.is_some(),
+            "the browser sign-in is collected later"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1113,6 +1145,15 @@ mod tests {
             take_ticket(&mut json!({"status":"consent_required","ticket":"bad ticket"})),
             None
         );
+        // The server uses the ticket up on any attempt, so the app never retries with it.
+        {
+            let mut state = cabinet.lock().unwrap();
+            state.ticket = "private-ticket".into();
+            state.saved.base_url = "https://127.0.0.1:9/api/v1".into();
+        }
+        let both = json!({"accept_terms":true,"accept_personal_data":true});
+        assert!(cabinet.auth("email-create", both).is_err());
+        assert!(cabinet.lock().unwrap().ticket.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

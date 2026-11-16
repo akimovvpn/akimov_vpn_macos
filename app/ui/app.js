@@ -602,15 +602,14 @@ const updateRow=()=>inforow("App updates","Install new macOS releases manually."
 function friendlyError(error){
  if(/device identification/i.test(String(error?.message||error)))return "Device identification is unavailable. Restart macOS and try again.";
  const text=String(error?.message||error||'');
+ /* the app's own sign-in messages are already worded for the person */
+ if(/^(That code is not right|Too many attempts\. Request|Too many codes today|New accounts by email are closed|This sign-up has expired|Sign-in was not completed|Could not open the browser|You can request a new code|This sign-in method is unavailable|Unknown sign-in method|Enter the six-digit code|Enter a valid email|Please accept both agreements|This code has expired)/.test(text))return text;
  if(/add route:.*file exists|tun_route_conflict/i.test(text))return 'Another VPN is using whole-device routes. Disconnect it, then connect again.';
  if(/TUN adapter could not start/i.test(text))return /permission denied|not permitted/i.test(text)?'The VPN adapter needs administrator access. Reinstall the network helper and try again.':'The macOS VPN adapter could not start. Disconnect other VPNs and try again.';
- if(/wrong.*(email|password)|incorrect.*(email|password)|invalid credentials|неверн.*парол/i.test(text))return 'Wrong email or password.';
  if(/sign in again|session expired|HTTP 401|not signed in/i.test(text))return 'Please sign in again.';
- if(/already registered|email.*registered|email уже/i.test(text))return 'This email is already registered. Try signing in.';
  if(/code.*expired|устарел|истек/i.test(text))return 'This code has expired. Request a new one.';
  if(/code.*incorrect|incorrect.*code|six-digit|неверн.*код/i.test(text))return 'That code is incorrect. Try again.';
  if(/valid email/i.test(text))return 'Enter a valid email address.';
- if(/password.*8.*128/i.test(text))return 'Use a password between 8 and 128 characters.';
  if(/accept.*agreement|accept.*terms|consent/i.test(text))return 'Please accept both agreements to create an account.';
  if(/too many|rate.limit|HTTP 429/i.test(text))return 'Too many attempts. Please wait and try again.';
  if(/insufficient balance|недостаточно/i.test(text))return 'Not enough balance. Top up or choose another payment method.';
@@ -749,7 +748,8 @@ const LOGIN_ICON={
  yandex:'<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="11" fill="#FC3F1D" stroke="none"/><text x="12" y="16.6" text-anchor="middle" font-family="Arial,sans-serif" font-weight="700" font-size="13" fill="#fff" stroke="none">Я</text></svg>',
  email:'<svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="4.5" width="15" height="11" rx="2"/><path d="m3 5.5 7 5.5 7-5.5"/></svg>'
 };
-let methodsLoading=false,oauthTimer=0,oauthSeq=0,resendTimer=0;
+let methodsLoading=false,oauthTimer=0,oauthSeq=0,resendTimer=0,oauthCancelling=Promise.resolve();
+addEventListener("online",()=>{if(S.auth.offline&&!S.signed_in)void loadMethods(true)});
 const lastLogin=()=>{try{return localStorage.getItem("akimov:last-login")}catch{return null}};
 const rememberLogin=m=>{try{localStorage.setItem("akimov:last-login",m)}catch{}};
 async function loadMethods(force=false){
@@ -781,7 +781,7 @@ function signInScreen(){
  if(current==="email")panel=emailPanel();
  else if(current&&a.oauth)panel=`<div class="auth-wait" role="status"><p class="cap">Enter this code in your browser to finish signing in with ${LOGIN_NAME[a.oauth.provider]}:</p><div class="auth-confirm">${esc(a.oauth.confirm)}</div><p class="cap dim">Waiting for your browser…</p><div class="auth-row"><button type="button" class="btn" data-act="auth-oauth-cancel">Cancel</button><button type="button" class="btn quiet" data-act="auth-oauth" data-v="${a.oauth.provider}">Start again</button></div></div>`;
  else if(current)panel=`<button type="button" class="btn primary block auth-provider" data-act="auth-oauth" data-v="${current}" ${S.authBusy?"disabled":""}>${LOGIN_ICON[current]}<span>Continue with ${LOGIN_NAME[current]}</span></button><p class="cap dim auth-hint">Opens your browser. You'll confirm there with a short code.</p>`;
- const quiet=!m.email&&m.email_signin&&current!=="email"?'<button type="button" class="auth-link auth-email-link" data-act="auth-email-open">Sign in with email</button>':"";
+ const quiet=!m.email&&m.email_signin&&!a.oauth?(current!=="email"?'<button type="button" class="auth-link auth-email-link" data-act="auth-email-open">Sign in with email</button>':enabled.length?'<button type="button" class="auth-link auth-email-link" data-act="auth-email-close">Other ways to sign in</button>':""):"";
  const note=a.offline?'<p class="cap auth-note" role="status">Can’t reach the server. Check your connection and try again.</p>':"";
  return `<section class="auth-wrap"><div class="auth-col">${lockup}${note}${tiles}<div class="auth-panel">${panel}</div>${quiet}</div></section>`;
 }
@@ -929,24 +929,25 @@ Object.assign(act,{
   }
 });
 async function signedIn(me){stopOAuth(false);S.auth.step='email';S.auth.emailOpen=false;engineBoot(await invoke('boot'));applyMe(me);go('home');paintScreen('home');if(await ensureSubscription())await loadNodes()}
-function stopOAuth(tell=true){oauthSeq++;clearTimeout(oauthTimer);if(S.auth.oauth&&tell)void invoke('cabinet_oauth_cancel').catch(()=>{});S.auth.oauth=null}
+function stopOAuth(tell=true){oauthSeq++;clearTimeout(oauthTimer);if(S.auth.oauth&&tell)oauthCancelling=invoke('cabinet_oauth_cancel').catch(()=>{});S.auth.oauth=null}
 /* The browser finishes the sign-in; the app asks every 1.5 s. A finished sign-in always counts, a stale answer otherwise changes nothing */
 async function pollOAuth(seq=oauthSeq){
  if(seq!==oauthSeq||!S.auth.oauth||S.signed_in)return;
  const provider=S.auth.oauth.provider;let result;
  try{result=await invoke('cabinet_oauth_poll')}catch(error){if(seq!==oauthSeq)return;S.auth.oauth=null;report(error);rr();return}
- if(result?.status==='signed_in'){rememberLogin(provider);await signedIn(result.me);return}
+ if(result?.status==='signed_in'){rememberLogin(provider);try{await signedIn(result.me)}catch(error){report(error)}return}
  if(seq!==oauthSeq)return;
  if(result?.status==='expired'){S.auth.oauth=null;toast('The sign-in request expired. Start again.');rr();return}
  oauthTimer=setTimeout(()=>pollOAuth(seq),1500);
 }
 function tickResend(){clearInterval(resendTimer);resendTimer=setInterval(()=>{const b=$('[data-act="auth-email-resend"]'),wait=Math.max(0,Math.ceil((S.auth.sentAt+60000-Date.now())/1000));if(S.signed_in||S.auth.step!=='code'||!b){clearInterval(resendTimer);return}b.disabled=wait>0;b.textContent=wait>0?`New code in ${wait} s`:'Send a new code';if(!wait)clearInterval(resendTimer)},1000)}
-act['auth-method']=el=>{if(S.authBusy||S.auth.oauth)return;S.auth.method=el.dataset.v;S.auth.emailOpen=false;rr()};
+act['auth-method']=el=>{if(S.auth.offline)void loadMethods(true);if(S.authBusy||S.auth.oauth)return;S.auth.method=el.dataset.v;S.auth.emailOpen=false;rr()};
 act['auth-oauth']=async el=>{if(S.authBusy)return;const provider=el.dataset.v;stopOAuth(false);S.authBusy=true;rr();
- try{const result=await invoke('cabinet_oauth_start',{provider});S.auth.oauth={provider,confirm:String(result.confirm_code||'')};S.auth.method=provider;const seq=oauthSeq;oauthTimer=setTimeout(()=>pollOAuth(seq),1500)}
+ try{await oauthCancelling;const result=await invoke('cabinet_oauth_start',{provider});S.auth.oauth={provider,confirm:String(result.confirm_code||'')};S.auth.method=provider;const seq=oauthSeq;oauthTimer=setTimeout(()=>pollOAuth(seq),1500)}
  catch(error){report(error)}finally{S.authBusy=false;if(!S.signed_in)rr()}};
 act['auth-oauth-cancel']=()=>{stopOAuth();rr()};
-act['auth-email-open']=()=>{S.auth.emailOpen=true;rr()};
+act['auth-email-open']=()=>{if(S.auth.oauth)return;S.auth.emailOpen=true;rr()};
+act['auth-email-close']=()=>{if(S.authBusy)return;S.auth.emailOpen=false;S.auth.step='email';rr()};
 act['auth-email-change']=()=>{if(S.authBusy)return;S.auth.step='email';rr()};
 act['auth-email-resend']=async el=>{if(S.authBusy||Date.now()<S.auth.sentAt+60000)return;S.authBusy=true;el.disabled=true;try{await invoke('cabinet_auth',{action:'email-code',body:{email:S.auth.email}});S.auth.sentAt=Date.now();toast('A new code has been sent.');tickResend()}catch(error){report(error)}finally{S.authBusy=false;if(!S.signed_in)rr()}};
 document.addEventListener('submit',async event=>{

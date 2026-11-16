@@ -18,15 +18,15 @@ const me = {id:1,email:'fixture@example.invalid',balance:100000,discount:{percen
   {id:77,plan:'Fixture <plan>',tariff_id:2,status:'active',days_left:30,term_days:90,expires_at:'2027-01-01T00:00:00Z',traffic_gb:500,used_gb:125,devices:5,plan_devices:5,plan_traffic_gb:500,extra_device_price_kopecks:1500,extra_gb_price_kopecks:5000,addon_months_remaining:2,renew_price_per_30_kopecks:25001},
   {id:78,plan:'Second',tariff_id:2,status:'active',days_left:60,term_days:90,expires_at:'2027-02-01T00:00:00Z',traffic_gb:100,used_gb:0,devices:3}
 ]};
-let latencyWait=null,offline=false,pollAnswers=[],methodsDown=false,methods={telegram:true,google:true,yandex:true,email:true,email_signin:true},deleteWait=null,buyTerminal=false,buyWait=null,connectWait=null,connectError=null,closeError=null,buyFails=1,promoFails=false,core={has_sub:true,connected:false,rules:[],mode:'tun',node:'Fixture <server>',hwid:'own/hwid',sub_id:77,version:'0.1.0'};
+let latencyWait=null,offline=false,pollAnswers=[],bootFails=false,cancelWait=null,methodsDown=false,methods={telegram:true,google:true,yandex:true,email:true,email_signin:true},deleteWait=null,buyTerminal=false,buyWait=null,connectWait=null,connectError=null,closeError=null,buyFails=1,promoFails=false,core={has_sub:true,connected:false,rules:[],mode:'tun',node:'Fixture <server>',hwid:'own/hwid',sub_id:77,version:'0.1.0'};
 const document={hidden:false,documentElement:element(),activeElement:element(),fonts:{ready:Promise.resolve()},querySelector:query,querySelectorAll:()=>[],createElement:element,addEventListener:(name,fn)=>(handlers[name]??=[]).push(fn)};
 const context = vm.createContext({document,window:{__TAURI__:{event:{listen:async(name,fn)=>events[name]=fn},core:{Channel:class {},invoke:async(name,args)=>{
   calls.push([name,args]);
-  if(name==='boot')return {...core};
+  if(name==='boot'){if(bootFails)throw 'Fixture boot failure';return {...core}}
   if(name==='cabinet_boot')return {configured:true,signed_in:true,base_url:'https://example.invalid/api/v1',cabinet_url:'https://example.invalid',me:structuredClone(me)};
   if(name==='cabinet_oauth_start')return {confirm_code:'4831',expires_in:300};
   if(name==='cabinet_oauth_poll'){const next=pollAnswers.shift()||{status:'pending'};if(next.status!=='signed_in')return next;core.has_sub=false;core.sub_id=null;return {status:'signed_in',me:structuredClone(me)}}
-  if(name==='cabinet_oauth_cancel')return null;
+  if(name==='cabinet_oauth_cancel')return cancelWait;
   if(name==='cabinet_auth'){if(args.action==='email-code')return {status:'code_sent'};if(args.action==='email-verify')return args.body.email==='new@example.invalid'?{status:'consent_required'}:(core.has_sub=false,core.sub_id=null,{status:'signed_in',me:structuredClone(me)});if(args.action==='email-create')return {status:'signed_in',me:structuredClone(me)};throw 'unexpected auth action'}
   if(name==='refresh_subscription')return {...core,profile:{title:'Fixture profile',total:0,upload:12,download:34,updated_at:1,update_hours:1}};
   if(name==='connect'){if(connectWait)return await connectWait;if(connectError)throw connectError;core.connected=true;return {ms:300}}
@@ -71,7 +71,7 @@ const flush = () => new Promise(resolve=>setImmediate(resolve));
   await run('toggle()');assert.equal(calls.at(-1)[0],'disconnect','a first connection remains cancellable after loading its plan');
   releaseProfileConnect({ms:10});await missingProfileConnect;connectWait=null;assert.equal(run('S.conn'),'idle');
   assert.equal(run('friendlyError("Internal error (HTTP 503) database failure")'),'Something went wrong. Try again later.');
-  assert.equal(run('friendlyError("Wrong email or password. (HTTP 401)")'),'Wrong email or password.');
+  for(const text of ['That code is not right. Check it and try again.','Too many attempts. Request a new code.','Too many codes today. Try again tomorrow or use another sign-in method.','New accounts by email are closed. Use another sign-in method.','This sign-up has expired. Request a new code.','Sign-in was not completed. Try again.','Could not open the browser.','You can request a new code in a minute.'])assert.equal(run(`friendlyError(${JSON.stringify(text)})`),text,'sign-in messages reach the user as written');
   assert.equal(run('S.logo'),3);
   const advance=t=>{now=t;const pending=[...frames];frames.clear();for(const [,fn]of pending)fn(t)};
   run('S.screen="home";startAnimation()');advance(0);assert.equal(frames.size,0,'reduced motion draws once and sleeps');
@@ -265,7 +265,11 @@ const flush = () => new Promise(resolve=>setImmediate(resolve));
   await run('pollOAuth()');assert.equal(run('S.signed_in'),false,'pending does not sign in');
   run('act["auth-oauth-cancel"]()');assert(calls.some(([name])=>name==='cabinet_oauth_cancel'));assert.doesNotMatch(run('signInScreen()'),/4831/);
   const pollsBefore=calls.filter(([name])=>name==='cabinet_oauth_poll').length;await run('pollOAuth()');assert.equal(calls.filter(([name])=>name==='cabinet_oauth_poll').length,pollsBefore,'cancel stops polling');
-  await run('act["auth-oauth"]({dataset:{v:"telegram"}})');pollAnswers.push({status:'signed_in'});await run('pollOAuth()');
+  let releaseCancel;cancelWait=new Promise(resolve=>releaseCancel=resolve);await run('act["auth-oauth"]({dataset:{v:"yandex"}})');run('act["auth-oauth-cancel"]()');
+  const starts=()=>calls.filter(([name])=>name==='cabinet_oauth_start').length,startsBefore=starts();const restart=run('act["auth-oauth"]({dataset:{v:"google"}})');await flush();
+  assert.equal(starts(),startsBefore,'a new start waits for the cancel to finish');releaseCancel(null);cancelWait=null;await restart;assert.equal(starts(),startsBefore+1);run('act["auth-oauth-cancel"]()');
+  await run('act["auth-oauth"]({dataset:{v:"google"}})');pollAnswers.push({status:'signed_in'});bootFails=true;await run('pollOAuth()');bootFails=false;assert.equal(run('S.auth.oauth'),null,'a failure after sign-in is reported, not thrown');
+  run('S.signed_in=false;S.me=null;S.screen="account"');await run('act["auth-oauth"]({dataset:{v:"telegram"}})');pollAnswers.push({status:'signed_in'});await run('pollOAuth()');
   assert.equal(run('S.signed_in'),true);assert.equal(run('S.screen'),'home');assert.equal(storage['akimov:last-login'],'telegram');
   // Email: address → code → signed in for an existing account.
   run('S.signed_in=false;S.me=null;S.screen="account";act["auth-method"]({dataset:{v:"email"}})');assert.match(run('signInScreen()'),/id="email-code"[\s\S]*Get code/);
@@ -277,6 +281,9 @@ const flush = () => new Promise(resolve=>setImmediate(resolve));
   assert(calls.some(([name,args])=>name==='cabinet_auth'&&args.action==='email-verify'&&args.body.email==='fixture@example.invalid'&&args.body.code==='123456'));
   assert.equal(run('S.signed_in'),true);assert.equal(run('S.has_sub'),true,'signing into an existing active plan loads its profile automatically');assert.equal(run('S.engine_sub_id'),run('S.activeSub'));assert(run('NODES.length')>0);
   assert.equal(storage['akimov:last-login'],'email');assert(!Object.values(storage).some(value=>value.includes('123456')),'codes never enter frontend storage');
+  run('NODES.push({id:"<node>",name:"<node>",sub:"<profile>",cc:"xx",ms:30})');
+  assert.doesNotMatch(run('nodesBody().body'),/<node>/,'subscription node names are escaped');
+  run('S.sheet="nodes"');handlers.keydown[0]({key:'Tab',target:element(),shiftKey:false,preventDefault(){}});run('S.sheet=null');
   // A new address: consents only after its code, then the account.
   run('S.signed_in=false;S.me=null;S.screen="account";act["auth-method"]({dataset:{v:"email"}})');assert.doesNotMatch(run('signInScreen()'),/id="terms"/);
   query('#email').value='new@example.invalid';await handlers.submit[0]({target:{id:'email-code',querySelector:()=>element()},preventDefault(){}});
@@ -289,10 +296,14 @@ const flush = () => new Promise(resolve=>setImmediate(resolve));
   methods={telegram:true,google:false,yandex:false,email:false,email_signin:true};run('S.signed_in=false;S.screen="account"');await run('loadMethods(true)');
   screen=run('signInScreen()');assert.doesNotMatch(screen,/class="auth-tile"/,'one method needs no tiles');assert.match(screen,/data-act="auth-email-open"/);
   run('act["auth-email-open"]()');assert.match(run('signInScreen()'),/id="email-code"/);
+  assert.match(run('signInScreen()'),/data-act="auth-email-close"/,'the email detour has a way back');run('act["auth-email-close"]()');assert.match(run('signInScreen()'),/data-act="auth-oauth" data-v="telegram"/);
+  await run('act["auth-oauth"]({dataset:{v:"telegram"}})');assert.doesNotMatch(run('signInScreen()'),/auth-email-open/,'no email detour while the browser is waiting');run('act["auth-oauth-cancel"]()');
   methods.email_signin=false;await run('loadMethods(true)');assert.doesNotMatch(run('signInScreen()'),/auth-email-open|id="email-code"/,'no email way in without mail');
   // Methods endpoint down: the last methods received and a note.
   methodsDown=true;await run('loadMethods(true)');screen=run('signInScreen()');assert.match(screen,/Can.t reach the server/);assert.match(screen,/data-act="auth-oauth" data-v="telegram"/);
-  methodsDown=false;methods={telegram:true,google:true,yandex:true,email:true,email_signin:true};await run('loadMethods(true)');
+  methodsDown=false;methods={telegram:true,google:true,yandex:true,email:true,email_signin:true};
+  const methodReads=()=>calls.filter(([name,args])=>name==='cabinet_request'&&args.path==='/auth/methods').length,readsBefore=methodReads();
+  run('act["auth-method"]({dataset:{v:"google"}})');await flush();assert(methodReads()>readsBefore,'a tap while offline asks the server again');assert.doesNotMatch(run('signInScreen()'),/Can.t reach the server/);
   run('S.has_sub=true;S.screen="settings"');await run('act["subscription-refresh"]()');assert.equal(run('S.profile.title'),'Fixture profile');assert.equal(run('S.profile.total'),0);
   const html=fs.readFileSync(path.join(__dirname,'../ui/index.html'),'utf8');assert.doesNotMatch(html,/<script>(?!\s*$)|fonts\.googleapis|id="brand"|class="proto"/);
   assert.doesNotMatch(source,/setInterval\(tick|pay-sim|function settlePay|anna@example|function seed\(|cabinet_configure|id="service"/);
