@@ -27,4 +27,8 @@ ditto "$destination/akimov vpn.app" "$stage/akimov vpn.app"
 ln -s /Applications "$stage/Applications"
 hdiutil create -volname 'akimov vpn' -srcfolder "$stage" -format UDZO -ov "$destination/akimov-vpn-$version-macos-$arch.dmg"
 (cd "$destination" && shasum -a 256 ./*.dmg > SHA256SUMS.txt)
+# Keep only this version's DMGs: loose .app copies show up in Spotlight and Launchpad beside the
+# installed app, and older versions are on the GitHub releases.
+rm -rf "$destination/akimov vpn.app" "src-tauri/target/$target/release/bundle/macos/akimov vpn.app"
+find dist -mindepth 1 -maxdepth 1 \( \( -name 'akimov-vpn-*' ! -name "akimov-vpn-$version-*" \) -o \( -name 'release-*' ! -name "release-$version" \) \) -exec rm -rf {} +
 printf 'Ready: %s/%s\n' "$PWD" "$destination"

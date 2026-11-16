@@ -761,7 +761,7 @@ async function loadMethods(force=false){
   /* Nothing signs in offline anyway: show what the server last offered, or every method */
   let saved=null;try{saved=JSON.parse(localStorage.getItem("akimov:login-methods"))}catch{}
   S.auth.methods=saved&&typeof saved==="object"?saved:{telegram:true,google:true,yandex:true,email:true,email_signin:true};S.auth.offline=true;
- }finally{methodsLoading=false;if(!S.signed_in)paintScreen("account")}
+ }finally{methodsLoading=false;if(!S.signed_in)paintScreen(S.screen)/* signed out, every screen draws the sign-in page */}
 }
 function emailPanel(){
  const a=S.auth,busy=S.authBusy?"disabled":"";
