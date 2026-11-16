@@ -18,14 +18,13 @@ const me = {id:1,email:'fixture@example.invalid',balance:100000,discount:{percen
   {id:77,plan:'Fixture <plan>',tariff_id:2,status:'active',days_left:30,term_days:90,expires_at:'2027-01-01T00:00:00Z',traffic_gb:500,used_gb:125,devices:5,plan_devices:5,plan_traffic_gb:500,extra_device_price_kopecks:1500,extra_gb_price_kopecks:5000,addon_months_remaining:2,renew_price_per_30_kopecks:25001},
   {id:78,plan:'Second',tariff_id:2,status:'active',days_left:60,term_days:90,expires_at:'2027-02-01T00:00:00Z',traffic_gb:100,used_gb:0,devices:3}
 ]};
-let latencyWait=null,offline=false,pollAnswers=[],bootFails=false,cancelWait=null,methodsDown=false,methods={telegram:true,google:true,yandex:true,email:true,email_signin:true},deleteWait=null,buyTerminal=false,buyWait=null,connectWait=null,connectError=null,closeError=null,buyFails=1,promoFails=false,core={has_sub:true,connected:false,rules:[],mode:'tun',node:'Fixture <server>',hwid:'own/hwid',sub_id:77,version:'0.1.0'};
+let latencyWait=null,offline=false,bootFails=false,cancelWait=null,methodsDown=false,methods={telegram:true,google:true,yandex:true,email:true,email_signin:true},deleteWait=null,buyTerminal=false,buyWait=null,connectWait=null,connectError=null,closeError=null,buyFails=1,promoFails=false,core={has_sub:true,connected:false,rules:[],mode:'tun',node:'Fixture <server>',hwid:'own/hwid',sub_id:77,version:'0.1.0'};
 const document={hidden:false,documentElement:element(),activeElement:element(),fonts:{ready:Promise.resolve()},querySelector:query,querySelectorAll:()=>[],createElement:element,addEventListener:(name,fn)=>(handlers[name]??=[]).push(fn)};
 const context = vm.createContext({document,window:{__TAURI__:{event:{listen:async(name,fn)=>events[name]=fn},core:{Channel:class {},invoke:async(name,args)=>{
   calls.push([name,args]);
   if(name==='boot'){if(bootFails)throw 'Fixture boot failure';return {...core}}
   if(name==='cabinet_boot')return {configured:true,signed_in:true,base_url:'https://example.invalid/api/v1',cabinet_url:'https://example.invalid',me:structuredClone(me)};
-  if(name==='cabinet_oauth_start')return {confirm_code:'4831',expires_in:300};
-  if(name==='cabinet_oauth_poll'){const next=pollAnswers.shift()||{status:'pending'};if(next.status!=='signed_in')return next;core.has_sub=false;core.sub_id=null;return {status:'signed_in',me:structuredClone(me)}}
+  if(name==='cabinet_oauth_start')return {expires_in:300};
   if(name==='cabinet_oauth_cancel')return cancelWait;
   if(name==='cabinet_auth'){if(args.action==='email-code')return {status:'code_sent'};if(args.action==='email-verify')return args.body.email==='new@example.invalid'?{status:'consent_required'}:(core.has_sub=false,core.sub_id=null,{status:'signed_in',me:structuredClone(me)});if(args.action==='email-create')return {status:'signed_in',me:structuredClone(me)};throw 'unexpected auth action'}
   if(name==='refresh_subscription')return {...core,profile:{title:'Fixture profile',total:0,upload:12,download:34,updated_at:1,update_hours:1}};
@@ -258,18 +257,19 @@ const flush = () => new Promise(resolve=>setImmediate(resolve));
   let screen=run('screens.account()');assert.doesNotMatch(screen,/type="password"|API URL|Forgot/);
   assert.deepEqual([...screen.matchAll(/class="auth-tile"[^>]*data-v="(\w+)"/g)].map(m=>m[1]),['telegram','google','yandex','email'],'one tile per method');
   assert.match(screen,/class="auth-lockup"/,'the logo sits above the tiles');
-  // Browser hand-off: the app shows the code to type in the browser, then a poll signs in.
+  // Browser sign-in: the browser comes back through akimovvpn://, Rust finishes it and tells the window. No code.
   run('act["auth-method"]({dataset:{v:"google"}})');assert.match(run('signInScreen()'),/data-act="auth-oauth" data-v="google"[^>]*>[\s\S]*Continue with Google/);
   await run('act["auth-oauth"]({dataset:{v:"google"}})');assert(calls.some(([name,args])=>name==='cabinet_oauth_start'&&args.provider==='google'));
-  assert.match(run('signInScreen()'),/4831/,'the confirmation code is shown');
-  await run('pollOAuth()');assert.equal(run('S.signed_in'),false,'pending does not sign in');
-  run('act["auth-oauth-cancel"]()');assert(calls.some(([name])=>name==='cabinet_oauth_cancel'));assert.doesNotMatch(run('signInScreen()'),/4831/);
-  const pollsBefore=calls.filter(([name])=>name==='cabinet_oauth_poll').length;await run('pollOAuth()');assert.equal(calls.filter(([name])=>name==='cabinet_oauth_poll').length,pollsBefore,'cancel stops polling');
+  screen=run('signInScreen()');assert.match(screen,/browser/i);assert.doesNotMatch(screen,/auth-confirm|Enter this code/,'no code to type');
+  assert(!calls.some(([name])=>name==='cabinet_oauth_poll'),'nothing polls');
+  run('act["auth-oauth-cancel"]()');assert(calls.some(([name])=>name==='cabinet_oauth_cancel'));assert.doesNotMatch(run('signInScreen()'),/Waiting for your browser/);
   let releaseCancel;cancelWait=new Promise(resolve=>releaseCancel=resolve);await run('act["auth-oauth"]({dataset:{v:"yandex"}})');run('act["auth-oauth-cancel"]()');
   const starts=()=>calls.filter(([name])=>name==='cabinet_oauth_start').length,startsBefore=starts();const restart=run('act["auth-oauth"]({dataset:{v:"google"}})');await flush();
   assert.equal(starts(),startsBefore,'a new start waits for the cancel to finish');releaseCancel(null);cancelWait=null;await restart;assert.equal(starts(),startsBefore+1);run('act["auth-oauth-cancel"]()');
-  await run('act["auth-oauth"]({dataset:{v:"google"}})');pollAnswers.push({status:'signed_in'});bootFails=true;await run('pollOAuth()');bootFails=false;assert.equal(run('S.auth.oauth'),null,'a failure after sign-in is reported, not thrown');
-  run('S.signed_in=false;S.me=null;S.screen="account"');await run('act["auth-oauth"]({dataset:{v:"telegram"}})');pollAnswers.push({status:'signed_in'});await run('pollOAuth()');
+  await run('act["auth-oauth"]({dataset:{v:"yandex"}})');await events.oauth({payload:{status:'error',provider:'yandex',message:'Sign-in was cancelled in the browser.'}});
+  assert.equal(run('S.auth.oauth'),null);assert.match(run('signInScreen()'),/Continue with Yandex ID/,'a refusal returns to the method');
+  await run('act["auth-oauth"]({dataset:{v:"google"}})');bootFails=true;await events.oauth({payload:{status:'signed_in',provider:'google',me:structuredClone(me)}});bootFails=false;assert.equal(run('S.auth.oauth'),null,'a failure after sign-in is reported, not thrown');
+  run('S.signed_in=false;S.me=null;S.screen="account"');await run('act["auth-oauth"]({dataset:{v:"telegram"}})');core.has_sub=false;core.sub_id=null;await events.oauth({payload:{status:'signed_in',provider:'telegram',me:structuredClone(me)}});
   assert.equal(run('S.signed_in'),true);assert.equal(run('S.screen'),'home');assert.equal(storage['akimov:last-login'],'telegram');
   // Email: address → code → signed in for an existing account.
   run('S.signed_in=false;S.me=null;S.screen="account";act["auth-method"]({dataset:{v:"email"}})');assert.match(run('signInScreen()'),/id="email-code"[\s\S]*Get code/);
