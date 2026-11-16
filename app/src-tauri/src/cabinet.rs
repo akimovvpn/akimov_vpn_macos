@@ -40,6 +40,10 @@ struct State {
     access: String,
     refresh: String,
     load_error: Option<String>,
+    // The browser hand-off in progress; its request token never leaves Rust.
+    oauth: Option<OAuthRequest>,
+    // A new email address's consent ticket, kept here so the window never sees it.
+    ticket: String,
 }
 
 pub struct Cabinet {
@@ -141,6 +145,8 @@ impl Cabinet {
                 access: String::new(),
                 refresh,
                 load_error,
+                oauth: None,
+                ticket: String::new(),
             }),
         }
     }
@@ -171,17 +177,22 @@ impl Cabinet {
         }))
     }
 
-    /// Starts Telegram's official sign-in: the cabinet issues a one-time challenge and names the bot.
-    pub fn telegram_challenge(&self) -> Result<TelegramChallenge, String> {
-        const UNAVAILABLE: &str = "Telegram sign-in is unavailable right now.";
-        let state = self.lock()?;
+    /// Starts a sign-in through the system browser. Returns the provider page to open and
+    /// the 4-digit code the person types on the callback page to bind it to this app.
+    pub fn oauth_start(&self, provider: &str) -> Result<(Url, Value), String> {
+        const UNAVAILABLE: &str = "This sign-in method is unavailable right now.";
+        if !OAUTH_PROVIDERS.contains(&provider) {
+            return Err("Unknown sign-in method.".into());
+        }
+        let mut state = self.lock()?;
+        state.oauth = None;
         let value = self
             .http(
                 &state.saved.base_url,
                 "POST",
-                "/auth/telegram/oauth/request",
+                "/auth/oauth/request",
                 None,
-                None,
+                Some(&json!({"provider": provider, "client": "desktop"})),
             )
             .map_err(|e| {
                 if e.status == 0 {
@@ -190,139 +201,114 @@ impl Cabinet {
                     UNAVAILABLE.into()
                 }
             })?;
-        TelegramChallenge::parse(&value, &state.saved.cabinet_url).ok_or_else(|| UNAVAILABLE.into())
+        let request =
+            OAuthRequest::parse(provider, &value, &state.saved.cabinet_url).ok_or(UNAVAILABLE)?;
+        let answer = json!({"confirm_code": request.confirm, "expires_in": request.expires});
+        let url = request.url.clone();
+        state.oauth = Some(request);
+        Ok((url, answer))
     }
 
-    /// The cabinet verifies the signature and consumes the one-time challenge before issuing a session.
-    pub fn telegram_complete(
-        &self,
-        challenge: &TelegramChallenge,
-        answer: &Value,
-    ) -> Result<Value, String> {
-        const REFUSED: &str = "Telegram sign-in was not completed. Try again.";
-        let body = challenge.answer_body(answer).ok_or(REFUSED)?;
+    /// Asks once whether the browser step finished: pending, signed in, or expired.
+    pub fn oauth_poll(&self) -> Result<Value, String> {
+        const FAILED: &str = "Sign-in was not completed. Try again.";
         let mut state = self.lock()?;
-        let tokens = self
+        let Some(request) = state.oauth.as_ref() else {
+            return Ok(json!({"status": "expired"}));
+        };
+        if std::time::Instant::now() >= request.deadline {
+            state.oauth = None;
+            return Ok(json!({"status": "expired"}));
+        }
+        let body = json!({"token": request.token});
+        let value = self
             .http(
                 &state.saved.base_url,
                 "POST",
-                "/auth/telegram/oauth/complete",
+                "/auth/oauth/poll",
                 None,
                 Some(&body),
             )
-            .map_err(|e| match e.status {
-                0 | 403 | 429 => e.message,
-                _ => REFUSED.into(),
-            })?;
-        let tokens = parse_tokens(tokens)?;
-        // Verify the account before replacing any existing session.
-        let me = self
-            .http(
-                &state.saved.base_url,
-                "GET",
-                "/me",
-                Some(&tokens.access_token),
-                None,
-            )
             .map_err(|e| e.message)?;
-        validate_me(&me)?;
-        self.set_tokens(&mut state, tokens)?;
-        Ok(me)
-    }
-
-    pub fn login(&self, email: &str, password: &str) -> Result<Value, String> {
-        let email = email.trim();
-        if email.is_empty()
-            || email.len() > 320
-            || !email.contains('@')
-            || password.is_empty()
-            || password.len() > 512
-        {
-            return Err("Enter a valid email and password.".into());
+        match value["status"].as_str() {
+            Some("pending") => return Ok(json!({"status": "pending"})),
+            Some("confirmed") => {}
+            Some("expired") => {
+                state.oauth = None;
+                return Ok(json!({"status": "expired"}));
+            }
+            _ => {
+                state.oauth = None;
+                return Err(FAILED.into());
+            }
         }
-        let mut state = self.lock()?;
-        let tokens = self
-            .http(
-                &state.saved.base_url,
-                "POST",
-                "/auth/login",
-                None,
-                Some(&json!({"email": email, "password": password})),
-            )
-            .map_err(|e| {
-                if e.status == 401 {
-                    "Wrong email or password.".into()
-                } else {
-                    e.message
-                }
-            })?;
-        let tokens = parse_tokens(tokens)?;
-        // Verify the account before replacing any existing session.
-        let me = self
-            .http(
-                &state.saved.base_url,
-                "GET",
-                "/me",
-                Some(&tokens.access_token),
-                None,
-            )
-            .map_err(|e| e.message)?;
-        validate_me(&me)?;
-        self.set_tokens(&mut state, tokens)?;
-        Ok(me)
+        state.oauth = None;
+        let me = self.adopt(&mut state, value).map_err(|_| FAILED)?;
+        Ok(json!({"status": "signed_in", "me": me}))
     }
 
+    pub fn oauth_cancel(&self) {
+        if let Ok(mut state) = self.lock() {
+            state.oauth = None;
+        }
+    }
+
+    /// Email sign-in by code: send it, check it, and (new address only) open the account.
     pub fn auth(&self, action: &str, body: Value) -> Result<Value, String> {
         let email = body["email"].as_str().unwrap_or("").trim();
-        let password = body["password"].as_str().unwrap_or("");
-        let path = match action {
-            "register" => "/auth/register",
-            "verify" => "/auth/verify",
-            "resend" => "/auth/resend",
-            "forgot" => "/auth/password/forgot",
-            "reset" => "/auth/password/reset",
+        let valid_email =
+            email.len() <= 320 && email.contains('@') && !email.contains(char::is_whitespace);
+        let mut state = self.lock()?;
+        let (path, request) = match action {
+            "email-code" if valid_email => ("/auth/email/code", json!({"email": email})),
+            "email-verify" if valid_email => {
+                let code = body["code"].as_str().unwrap_or("");
+                if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err("Enter the six-digit code from your email.".into());
+                }
+                ("/auth/email/verify", json!({"email": email, "code": code}))
+            }
+            "email-create" => {
+                if body["accept_terms"] != true || body["accept_personal_data"] != true {
+                    return Err("Please accept both agreements to create an account.".into());
+                }
+                if state.ticket.is_empty() {
+                    return Err(SIGNUP_EXPIRED.into());
+                }
+                let request = json!({"ticket": state.ticket, "accept_terms": true, "accept_personal_data": true});
+                ("/auth/email/create", request)
+            }
+            "email-code" | "email-verify" => return Err("Enter a valid email address.".into()),
             _ => return Err("Something went wrong. Try again later.".into()),
         };
-        if action != "reset" && (email.len() > 320 || !email.contains('@')) {
-            return Err("Enter a valid email address.".into());
-        }
-        if ["register", "reset"].contains(&action) && !(8..=128).contains(&password.chars().count())
+        let mut result = match self.http(&state.saved.base_url, "POST", path, None, Some(&request))
         {
-            return Err("Use a password between 8 and 128 characters.".into());
-        }
-        if action == "register"
-            && (body["accept_terms"] != true || body["accept_personal_data"] != true)
-        {
-            return Err("Please accept both agreements to create an account.".into());
-        }
-        if action == "verify"
-            && !body["code"]
-                .as_str()
-                .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
-        {
-            return Err("Enter the six-digit code from your email.".into());
-        }
-        if action == "reset"
-            && !body["token"].as_str().is_some_and(|s| {
-                !s.is_empty()
-                    && s.len() <= 2048
-                    && s.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            })
-        {
-            return Err("Paste a valid reset link from your email.".into());
-        }
-        let mut state = self.lock()?;
-        let result = self
-            .http(&state.saved.base_url, "POST", path, None, Some(&body))
-            .map_err(|e| e.message)?;
-        if result.get("access_token").is_none() {
-            if ["verify", "reset"].contains(&action) {
-                return Err("Something went wrong. Try again later.".into());
+            Ok(result) => result,
+            // A code already went out less than a minute ago: let it be typed in.
+            Err(e) if action == "email-code" && e.message == CODE_WAIT => {
+                return Ok(json!({"status": "code_sent"}))
             }
-            return Ok(result);
+            Err(e) => return Err(e.message),
+        };
+        if result.get("access_token").is_none() {
+            return match (action, result["status"].as_str()) {
+                ("email-code", Some("code_sent")) => Ok(json!({"status": "code_sent"})),
+                ("email-verify", Some("consent_required")) => {
+                    state.ticket =
+                        take_ticket(&mut result).ok_or("Something went wrong. Try again later.")?;
+                    Ok(result)
+                }
+                _ => Err("Something went wrong. Try again later.".into()),
+            };
         }
-        let tokens = parse_tokens(result)?;
+        state.ticket.clear();
+        let me = self.adopt(&mut state, result)?;
+        Ok(json!({"status": "signed_in", "me": me}))
+    }
+
+    /// Checks a fresh session against /me before it replaces the saved one.
+    fn adopt(&self, state: &mut State, value: Value) -> Result<Value, String> {
+        let tokens = parse_tokens(value)?;
         let me = self
             .http(
                 &state.saved.base_url,
@@ -333,8 +319,8 @@ impl Cabinet {
             )
             .map_err(|e| e.message)?;
         validate_me(&me)?;
-        self.set_tokens(&mut state, tokens)?;
-        Ok(json!({"status":"signed_in","me":me}))
+        self.set_tokens(state, tokens)?;
+        Ok(me)
     }
 
     pub fn logout(&self) -> Result<Value, String> {
@@ -347,9 +333,9 @@ impl Cabinet {
         let method = method.to_ascii_uppercase();
         validate_request(&method, path, body.as_ref())?;
         let mut state = self.lock()?;
-        if method == "GET" && path == "/legal" {
+        if method == "GET" && matches!(path, "/legal" | "/auth/methods") {
             return self
-                .http(&state.saved.base_url, "GET", "/legal", None, None)
+                .http(&state.saved.base_url, "GET", path, None, None)
                 .map_err(|e| e.message);
         }
         self.authenticated(&mut state, &method, path, body.as_ref())
@@ -577,40 +563,48 @@ impl Cabinet {
     }
 }
 
-pub struct TelegramChallenge {
+const OAUTH_PROVIDERS: [&str; 3] = ["telegram", "google", "yandex"];
+const CODE_WAIT: &str = "You can request a new code in a minute.";
+const SIGNUP_EXPIRED: &str = "This sign-up has expired. Request a new code.";
+
+/// A browser sign-in the cabinet started for this app.
+pub struct OAuthRequest {
     token: String,
-    state: String,
-    callback: Url,
-    pub url: Url,
-    pub expires: u64,
+    confirm: String,
+    url: Url,
+    expires: u64,
+    deadline: std::time::Instant,
 }
 
-impl TelegramChallenge {
-    fn parse(value: &Value, site: &str) -> Option<Self> {
+impl OAuthRequest {
+    /// Accepts only the provider's own HTTPS page, sending the person back to this
+    /// cabinet's callback for that provider with PKCE; anything else is never opened.
+    fn parse(provider: &str, value: &Value, site: &str) -> Option<Self> {
+        let endpoint = match provider {
+            "telegram" => "https://oauth.telegram.org/auth",
+            "google" => "https://accounts.google.com/o/oauth2/v2/auth",
+            "yandex" => "https://oauth.yandex.ru/authorize",
+            _ => return None,
+        };
         let token = value["token"].as_str()?;
-        let nonce = value["nonce"].as_str()?;
         let state = value["state"].as_str()?;
-        let client = value["client_id"].as_str()?;
-        let id = client.parse::<u64>().ok()?;
+        let confirm = value["confirm_code"].as_str()?;
         let expires = value["expires_in"].as_u64()?;
         if !valid_token(token)
-            || !valid_token(nonce)
             || !valid_token(state)
             || token == state
-            || state.len() > 256
-            || nonce.len() > 256
-            || !client.bytes().all(|b| b.is_ascii_digit())
-            || id == 0
-            || id > 9_007_199_254_740_991
-            || expires == 0
+            || state.len() > 512
+            || confirm.len() != 4
+            || !confirm.bytes().all(|b| b.is_ascii_digit())
+            || !(1..=300).contains(&expires)
             || origin(site, false).ok()?.as_str() != site
         {
             return None;
         }
-        let callback = Url::parse(&format!("{site}/auth/telegram/callback")).ok()?;
         let url = Url::parse(value["authorization_url"].as_str()?).ok()?;
-        if url.origin().ascii_serialization() != "https://oauth.telegram.org"
-            || url.path() != "/auth"
+        let expected = Url::parse(endpoint).ok()?;
+        if url.origin() != expected.origin()
+            || url.path() != expected.path()
             || !url.username().is_empty()
             || url.password().is_some()
             || url.fragment().is_some()
@@ -626,24 +620,23 @@ impl TelegramChallenge {
                 return None;
             }
         }
+        let callback = format!("{site}/auth/{provider}/callback");
         let required = [
             ("response_type", "code"),
-            ("client_id", client),
             ("redirect_uri", callback.as_str()),
-            ("scope", "openid profile"),
-            ("nonce", nonce),
             ("state", state),
             ("code_challenge_method", "S256"),
         ];
-        if params.len() != 8
-            || required
-                .iter()
-                .any(|(k, v)| params.get(*k).map(String::as_str) != Some(*v))
-        {
-            return None;
-        }
         let proof = params.get("code_challenge")?;
-        if proof.len() != 43
+        if required
+            .iter()
+            .any(|(k, v)| params.get(*k).map(String::as_str) != Some(*v))
+            || params.contains_key("client_secret")
+            || params.contains_key("code_verifier")
+            || params
+                .get("client_id")
+                .is_none_or(|id| id.is_empty() || id == token)
+            || proof.len() != 43
             || !proof
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
@@ -652,66 +645,21 @@ impl TelegramChallenge {
         }
         Some(Self {
             token: token.into(),
-            state: state.into(),
-            callback,
+            confirm: confirm.into(),
             url,
-            expires: expires.min(600),
+            expires,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(expires),
         })
     }
-
-    pub fn callback_url(&self) -> Url {
-        self.callback.clone()
-    }
-
-    pub fn state(&self) -> &str {
-        &self.state
-    }
-
-    fn answer_body(&self, answer: &Value) -> Option<Value> {
-        let code = answer["code"].as_str()?;
-        if answer["state"].as_str() != Some(self.state.as_str()) || !valid_code(code) {
-            return None;
-        }
-        Some(json!({"token": self.token, "state": self.state, "code": code}))
-    }
 }
 
-fn valid_code(code: &str) -> bool {
-    !code.is_empty() && code.len() <= 4096 && code.bytes().all(|b| b.is_ascii_graphic())
-}
-
-/// Intercept the registered callback before loading it; no authorization code reaches a web page.
-pub fn telegram_callback(url: &Url, expected: &Url, state: &str) -> Option<Option<String>> {
-    if url.origin() != expected.origin()
-        || url.path() != expected.path()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    let mut params = std::collections::HashMap::new();
-    for (key, value) in url.query_pairs() {
-        if !matches!(
-            key.as_ref(),
-            "state" | "code" | "error" | "error_description"
-        ) || params
-            .insert(key.into_owned(), value.into_owned())
-            .is_some()
-        {
-            return None;
-        }
-    }
-    if params.get("state").map(String::as_str) != Some(state) {
-        return None;
-    }
-    match (params.get("code"), params.get("error")) {
-        (Some(code), None) if valid_code(code) && !params.contains_key("error_description") => {
-            Some(Some(json!({"state": state, "code": code}).to_string()))
-        }
-        (None, Some(error)) if !error.is_empty() => Some(None),
-        _ => None,
-    }
+/// Removes the consent ticket from a server answer; the window gets the rest.
+fn take_ticket(answer: &mut Value) -> Option<String> {
+    let ticket = answer.as_object_mut()?.remove("ticket")?;
+    ticket
+        .as_str()
+        .filter(|t| valid_token(t))
+        .map(str::to_owned)
 }
 
 struct HttpError {
@@ -738,6 +686,25 @@ fn api_error(status: u16, value: &Value) -> HttpError {
         400 => "Check the details and try again.",
         _ => "Something went wrong. Try again later.",
     };
+    // The server writes Russian; this app speaks English, so known failures go by their code.
+    let coded = match value["code"].as_str().unwrap_or("") {
+        "code_wait" => Some(CODE_WAIT),
+        "code_invalid" => Some("That code is not right. Check it and try again."),
+        "code_expired" => Some("This code has expired. Request a new one."),
+        "code_locked" => Some("Too many attempts. Request a new code."),
+        "code_limit" => {
+            Some("Too many codes today. Try again tomorrow or use another sign-in method.")
+        }
+        "signup_closed" => Some("New accounts by email are closed. Use another sign-in method."),
+        "signup_expired" => Some(SIGNUP_EXPIRED),
+        _ => None,
+    };
+    if let Some(message) = coded {
+        return HttpError {
+            status,
+            message: message.into(),
+        };
+    }
     let raw = value["error"].as_str().unwrap_or("").to_lowercase();
     let message = if status == 400 && (raw.contains("код") || raw.contains("code")) {
         "That code is incorrect. Try again."
@@ -881,6 +848,7 @@ fn validate_request(method: &str, path: &str, body: Option<&Value>) -> Result<()
                 route,
                 "/me"
                     | "/legal"
+                    | "/auth/methods"
                     | "/me/traffic"
                     | "/me/transactions"
                     | "/tariffs"
@@ -994,142 +962,158 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn oauth_value(provider: &str) -> Value {
+        let endpoint = match provider {
+            "telegram" => "https://oauth.telegram.org/auth",
+            "google" => "https://accounts.google.com/o/oauth2/v2/auth",
+            _ => "https://oauth.yandex.ru/authorize",
+        };
+        let mut url = Url::parse(endpoint).unwrap();
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", "client-1")
+            .append_pair(
+                "redirect_uri",
+                &format!("https://akimov.bid/auth/{provider}/callback"),
+            )
+            .append_pair("state", "server-random-state")
+            .append_pair("code_challenge", &"a".repeat(43))
+            .append_pair("code_challenge_method", "S256");
+        json!({"token":"one-time-request", "state":"server-random-state", "expires_in":300, "confirm_code":"4831", "authorization_url":url.as_str()})
+    }
+
     #[test]
-    fn telegram_answers_without_a_challenge_bound_code_never_reach_the_cabinet() {
-        let dir = scratch("telegram");
-        let cabinet = Cabinet::new(dir.clone());
-        let challenge = telegram_challenge();
-        for junk in [
-            json!(null),
-            json!(42),
-            json!(""),
-            json!("has spaces"),
-            json!({"id": 1}),
-            json!({"id_token": "bad token"}),
-            json!({"hash": "legacy-widget-hash", "id": 1}),
-        ] {
-            let error = cabinet.telegram_complete(&challenge, &junk).unwrap_err();
+    fn oauth_request_accepts_only_registered_providers_and_callbacks() {
+        for provider in ["telegram", "google", "yandex"] {
+            let request =
+                OAuthRequest::parse(provider, &oauth_value(provider), "https://akimov.bid")
+                    .unwrap_or_else(|| panic!("{provider} refused"));
+            assert_eq!(request.confirm, "4831");
+            assert_eq!(request.token, "one-time-request");
+            let url = oauth_value(provider)["authorization_url"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let other = if provider == "google" {
+                "yandex"
+            } else {
+                "google"
+            };
+            let bad_urls = [
+                url.replace("https:", "http:"),
+                url.replace("https://", "https://user@"),
+                url.clone() + "#x",
+                url.clone() + "&state=server-random-state",
+                url.clone() + "&client_secret=s",
+                url.clone() + "&code_verifier=v",
+                url.replace("%2Fauth%2F", "%2Fother%2F"),
+                url.replace(&format!("%2F{provider}%2F"), &format!("%2F{other}%2F")),
+                url.replace("code_challenge_method=S256", "code_challenge_method=plain"),
+                url.replace(&"a".repeat(43), "short"),
+                url.replace("client_id=client-1", "client_id=one-time-request"),
+                url.replace("https://", "https://attacker.example/?"),
+            ];
+            for bad in bad_urls {
+                let mut value = oauth_value(provider);
+                value["authorization_url"] = json!(bad);
+                assert!(
+                    OAuthRequest::parse(provider, &value, "https://akimov.bid").is_none(),
+                    "{bad}"
+                );
+            }
+            for patch in [
+                json!({"confirm_code":"483"}),
+                json!({"confirm_code":"48a1"}),
+                json!({"state":"one-time-request"}),
+                json!({"token":"bad token"}),
+                json!({"expires_in":0}),
+                json!({"expires_in":301}),
+            ] {
+                let mut value = oauth_value(provider);
+                for (k, v) in patch.as_object().unwrap() {
+                    value[k] = v.clone();
+                }
+                assert!(
+                    OAuthRequest::parse(provider, &value, "https://akimov.bid").is_none(),
+                    "{patch}"
+                );
+            }
             assert!(
-                error.starts_with("Telegram sign-in was not completed"),
-                "{junk}"
+                OAuthRequest::parse(provider, &oauth_value(provider), "https://other.example")
+                    .is_none()
             );
         }
+        assert!(
+            OAuthRequest::parse("github", &oauth_value("google"), "https://akimov.bid").is_none()
+        );
+    }
+
+    #[test]
+    fn oauth_poll_without_a_request_or_after_cancel_never_signs_in() {
+        let dir = scratch("oauth");
+        let cabinet = Cabinet::new(dir.clone());
+        assert_eq!(cabinet.oauth_poll().unwrap()["status"], "expired");
+        cabinet.lock().unwrap().oauth = Some(
+            OAuthRequest::parse("google", &oauth_value("google"), "https://akimov.bid").unwrap(),
+        );
+        cabinet.oauth_cancel();
+        assert_eq!(cabinet.oauth_poll().unwrap()["status"], "expired");
+        assert!(cabinet.oauth_start("github").is_err());
         let _ = fs::remove_dir_all(dir);
     }
 
-    fn telegram_value() -> Value {
-        let mut url = Url::parse("https://oauth.telegram.org/auth").unwrap();
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", "9010497295")
-            .append_pair("redirect_uri", "https://akimov.bid/auth/telegram/callback")
-            .append_pair("scope", "openid profile")
-            .append_pair("state", "server-random-state")
-            .append_pair("nonce", "server-random-nonce")
-            .append_pair("code_challenge", &"a".repeat(43))
-            .append_pair("code_challenge_method", "S256");
-        json!({"token":"one-time-challenge", "nonce":"server-random-nonce", "state":"server-random-state", "client_id":"9010497295", "expires_in":300, "authorization_url":url.as_str()})
-    }
-
-    fn telegram_challenge() -> TelegramChallenge {
-        TelegramChallenge::parse(&telegram_value(), "https://akimov.bid").unwrap()
+    #[test]
+    fn email_errors_map_machine_codes_to_english() {
+        for (code, words) in [
+            ("code_wait", "a minute"),
+            ("code_invalid", "not right"),
+            ("code_expired", "expired"),
+            ("code_locked", "Too many attempts"),
+            ("code_limit", "today"),
+            ("signup_closed", "closed"),
+            ("signup_expired", "expired"),
+        ] {
+            let error = api_error(400, &json!({"error":"Русский текст","code":code}));
+            assert!(error.message.contains(words), "{code}: {}", error.message);
+            assert!(!error.message.contains("Русский"));
+        }
     }
 
     #[test]
-    fn telegram_code_flow_accepts_only_the_registered_provider_and_callback() {
-        let challenge = telegram_challenge();
-        assert_eq!(
-            challenge.url.origin().ascii_serialization(),
-            "https://oauth.telegram.org"
-        );
-        assert_eq!(
-            challenge.callback_url().as_str(),
-            "https://akimov.bid/auth/telegram/callback"
-        );
-        assert_eq!(challenge.expires, 300);
-        for (name, replacement) in [
-            ("response_type", "post_message"),
-            ("client_id", "12345"),
-            ("state", "other-state"),
-            ("nonce", "other-nonce"),
-            ("redirect_uri", "https://evil.example/callback"),
-            ("code_challenge", "short"),
-            ("code_challenge_method", "plain"),
-            ("scope", "openid profile phone"),
+    fn email_actions_validate_input_and_keep_the_ticket_private() {
+        let dir = scratch("email");
+        let cabinet = Cabinet::new(dir.clone());
+        for (action, body) in [
+            ("email-code", json!({"email":"not-an-email"})),
+            ("email-verify", json!({"email":"a@b.test","code":"12345"})),
+            ("email-verify", json!({"email":"a@b.test","code":"12a456"})),
+            (
+                "email-create",
+                json!({"accept_terms":true,"accept_personal_data":false}),
+            ),
+            (
+                "email-create",
+                json!({"accept_terms":true,"accept_personal_data":true}),
+            ),
+            (
+                "register",
+                json!({"email":"a@b.test","password":"password1"}),
+            ),
+            ("reset", json!({"token":"t","password":"password1"})),
         ] {
-            let mut value = telegram_value();
-            let mut url = Url::parse(value["authorization_url"].as_str().unwrap()).unwrap();
-            let pairs: Vec<_> = url
-                .query_pairs()
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                .collect();
-            url.set_query(None);
-            for (key, content) in pairs {
-                url.query_pairs_mut()
-                    .append_pair(&key, if key == name { replacement } else { &content });
-            }
-            value["authorization_url"] = url.as_str().into();
             assert!(
-                TelegramChallenge::parse(&value, "https://akimov.bid").is_none(),
-                "{name}"
+                cabinet.auth(action, body.clone()).is_err(),
+                "{action} {body}"
             );
         }
-        for extra in [
-            "&client_secret=secret",
-            "&code_verifier=private",
-            "&state=server-random-state",
-            "#fragment",
-        ] {
-            let mut value = telegram_value();
-            value["authorization_url"] =
-                format!("{}{extra}", value["authorization_url"].as_str().unwrap()).into();
-            assert!(TelegramChallenge::parse(&value, "https://akimov.bid").is_none());
-        }
-        let mut value = telegram_value();
-        value["authorization_url"] = "https://evil.example/auth".into();
-        assert!(TelegramChallenge::parse(&value, "https://akimov.bid").is_none());
-    }
-
-    #[test]
-    fn telegram_callback_requires_matching_state_and_unambiguous_code() {
-        let challenge = telegram_challenge();
-        let expected = challenge.callback_url();
-        for bad in [
-            "http://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc",
-            "https://evil.example/auth/telegram/callback?state=server-random-state&code=abc",
-            "https://user@akimov.bid/auth/telegram/callback?state=server-random-state&code=abc",
-            "https://akimov.bid/other?state=server-random-state&code=abc",
-            "https://akimov.bid/auth/telegram/callback?state=other&code=abc",
-            "https://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc&code=def",
-            "https://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc&error=denied",
-            "https://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc#fragment",
-            "https://akimov.bid/auth/telegram/callback?state=server-random-state&code=",
-        ] { assert_eq!(telegram_callback(&Url::parse(bad).unwrap(),&expected,"server-random-state"),None,"{bad}"); }
-        let answer=telegram_callback(&Url::parse("https://akimov.bid/auth/telegram/callback?state=server-random-state&code=abc%2F%2B%3D").unwrap(),&expected,"server-random-state").unwrap().unwrap();
+        let mut answer = json!({"status":"consent_required","ticket":"private-ticket"});
+        assert_eq!(take_ticket(&mut answer).as_deref(), Some("private-ticket"));
+        assert_eq!(answer, json!({"status":"consent_required"}));
         assert_eq!(
-            serde_json::from_str::<Value>(&answer).unwrap(),
-            json!({"state":"server-random-state","code":"abc/+="})
+            take_ticket(&mut json!({"status":"consent_required","ticket":"bad ticket"})),
+            None
         );
-        assert_eq!(telegram_callback(&Url::parse("https://akimov.bid/auth/telegram/callback?state=server-random-state&error=access_denied").unwrap(),&expected,"server-random-state"),Some(None));
-    }
-
-    #[test]
-    fn telegram_completion_sends_only_code_state_and_private_request_token() {
-        let challenge = telegram_challenge();
-        assert_eq!(
-            challenge
-                .answer_body(&json!({"state":"server-random-state","code":"abc/+="}))
-                .unwrap(),
-            json!({"token":"one-time-challenge","state":"server-random-state","code":"abc/+="})
-        );
-        for answer in [
-            json!({"state":"wrong","code":"abc"}),
-            json!({"state":"server-random-state","code":""}),
-            json!({"id_token":"legacy-token"}),
-            json!({"state":"server-random-state","code":"abc\r\n"}),
-        ] {
-            assert!(challenge.answer_body(&answer).is_none());
-        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1241,21 +1225,24 @@ mod tests {
     #[test]
     fn public_auth_rejects_invalid_input_before_sending_any_request() {
         let cabinet = Cabinet::new(std::env::temp_dir().join("akimov-auth-validation-only"));
-        assert!(cabinet.auth("register",json!({"email":"test@example.invalid","password":"valid-password","accept_terms":true,"accept_personal_data":false})).unwrap_err().contains("agreements"));
         assert!(cabinet
             .auth(
-                "verify",
+                "email-create",
+                json!({"accept_terms":true,"accept_personal_data":false})
+            )
+            .unwrap_err()
+            .contains("agreements"));
+        assert!(cabinet
+            .auth(
+                "email-verify",
                 json!({"email":"test@example.invalid","code":"12"})
             )
             .unwrap_err()
             .contains("six-digit"));
         assert!(cabinet
-            .auth(
-                "reset",
-                json!({"token":"bad token","password":"valid-password"})
-            )
+            .auth("email-code", json!({"email":"no address"}))
             .unwrap_err()
-            .contains("reset link"));
+            .contains("valid email"));
         assert!(cabinet.auth("admin", Value::Null).is_err());
     }
 

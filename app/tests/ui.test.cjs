@@ -18,15 +18,16 @@ const me = {id:1,email:'fixture@example.invalid',balance:100000,discount:{percen
   {id:77,plan:'Fixture <plan>',tariff_id:2,status:'active',days_left:30,term_days:90,expires_at:'2027-01-01T00:00:00Z',traffic_gb:500,used_gb:125,devices:5,plan_devices:5,plan_traffic_gb:500,extra_device_price_kopecks:1500,extra_gb_price_kopecks:5000,addon_months_remaining:2,renew_price_per_30_kopecks:25001},
   {id:78,plan:'Second',tariff_id:2,status:'active',days_left:60,term_days:90,expires_at:'2027-02-01T00:00:00Z',traffic_gb:100,used_gb:0,devices:3}
 ]};
-let latencyWait=null,offline=false,telegramAnswers=false,deleteWait=null,buyTerminal=false,buyWait=null,connectWait=null,connectError=null,closeError=null,buyFails=1,promoFails=false,core={has_sub:true,connected:false,rules:[],mode:'tun',node:'Fixture <server>',hwid:'own/hwid',sub_id:77,version:'0.1.0'};
+let latencyWait=null,offline=false,pollAnswers=[],methodsDown=false,methods={telegram:true,google:true,yandex:true,email:true,email_signin:true},deleteWait=null,buyTerminal=false,buyWait=null,connectWait=null,connectError=null,closeError=null,buyFails=1,promoFails=false,core={has_sub:true,connected:false,rules:[],mode:'tun',node:'Fixture <server>',hwid:'own/hwid',sub_id:77,version:'0.1.0'};
 const document={hidden:false,documentElement:element(),activeElement:element(),fonts:{ready:Promise.resolve()},querySelector:query,querySelectorAll:()=>[],createElement:element,addEventListener:(name,fn)=>(handlers[name]??=[]).push(fn)};
 const context = vm.createContext({document,window:{__TAURI__:{event:{listen:async(name,fn)=>events[name]=fn},core:{Channel:class {},invoke:async(name,args)=>{
   calls.push([name,args]);
   if(name==='boot')return {...core};
   if(name==='cabinet_boot')return {configured:true,signed_in:true,base_url:'https://example.invalid/api/v1',cabinet_url:'https://example.invalid',me:structuredClone(me)};
-  if(name==='cabinet_login'){core.has_sub=false;core.sub_id=null;return structuredClone(me);}
-  if(name==='cabinet_telegram_login'){if(!telegramAnswers)return null;core.has_sub=false;core.sub_id=null;return structuredClone(me);}
-  if(name==='cabinet_auth'){if(args.action==='register')return {status:'verification_required',email:args.body.email};if(args.action==='verify'||args.action==='reset')return {status:'signed_in',me:structuredClone(me)};return {status:'reset_sent'}}
+  if(name==='cabinet_oauth_start')return {confirm_code:'4831',expires_in:300};
+  if(name==='cabinet_oauth_poll'){const next=pollAnswers.shift()||{status:'pending'};if(next.status!=='signed_in')return next;core.has_sub=false;core.sub_id=null;return {status:'signed_in',me:structuredClone(me)}}
+  if(name==='cabinet_oauth_cancel')return null;
+  if(name==='cabinet_auth'){if(args.action==='email-code')return {status:'code_sent'};if(args.action==='email-verify')return args.body.email==='new@example.invalid'?{status:'consent_required'}:(core.has_sub=false,core.sub_id=null,{status:'signed_in',me:structuredClone(me)});if(args.action==='email-create')return {status:'signed_in',me:structuredClone(me)};throw 'unexpected auth action'}
   if(name==='refresh_subscription')return {...core,profile:{title:'Fixture profile',total:0,upload:12,download:34,updated_at:1,update_hours:1}};
   if(name==='connect'){if(connectWait)return await connectWait;if(connectError)throw connectError;core.connected=true;return {ms:300}}
   if(name==='disconnect'){core.connected=false;return {ok:true}}
@@ -37,6 +38,7 @@ const context = vm.createContext({document,window:{__TAURI__:{event:{listen:asyn
   if(name==='proxies'||name==='test_latency')return {nodes:[{name:'Fixture <server>',delay:30}],now:'Fixture <server>'};
   if(name==='cabinet_request'){
     if(offline)throw 'Cabinet connection failed. Check your internet and API address.';
+    if(args.path==='/auth/methods'){if(methodsDown)throw 'Cabinet connection failed. Check your internet and API address.';return structuredClone(methods)}
     if(args.path==='/legal')return {version:'2026-10-21',docs:[{key:'offer',title:'Public offer',url:'https://example.invalid/offer'},{key:'privacy',title:'Privacy policy',url:'https://example.invalid/privacy'}]};
     if(args.path==='/me/transactions')return {transactions:[{id:1,type:'topup',amount_kopecks:1234,status:'completed',created_at:'2026-11-10T10:00:00Z',description:'Fixture credit'},{id:2,type:'purchase',amount_kopecks:-567,status:'completed',created_at:'2026-11-09T10:00:00Z',description:'<plan>'}]};
     if(args.path==='/promo'&&promoFails)throw 'HTTP 503 internal failure';
@@ -251,31 +253,46 @@ const flush = () => new Promise(resolve=>setImmediate(resolve));
   assert.equal(JSON.stringify(calls.at(-1)),JSON.stringify(['close_connections',{id:null,process:'fixture.exe'}]));assert.equal(run('S.conns.length'),1);assert.equal(run('S.conns[0].connectionId'),'other','closing a process leaves other processes alone');run('S.paused=false');
 
   await events.dropped();assert.equal(run('S.conn'),'idle');
-  run('S.signed_in=false;S.screen="account"');assert.match(run('screens.account()'),/id="email"/);assert.doesNotMatch(run('screens.account()'),/API URL/);
-  query('#email').value='fixture@example.invalid';query('#password').value='fixture-only-password';
-  await handlers.submit[0]({target:{id:'login',querySelector:()=>element()},preventDefault(){}});
-  assert(calls.some(([name,args])=>name==='cabinet_login'&&args.email==='fixture@example.invalid'));
-  assert.equal(run('S.signed_in'),true);assert(!Object.values(storage).some(value=>value.includes('fixture-only-password')),'credentials must never enter frontend storage');
-  run('NODES.push({id:"<node>",name:"<node>",sub:"<profile>",cc:"xx",ms:30})');
-  assert.doesNotMatch(run('nodesBody().body'),/<node>/,'subscription node names are escaped');
-  run('S.sheet="nodes"');handlers.keydown[0]({key:'Tab',target:element(),shiftKey:false,preventDefault(){}});
-  // Telegram sign-in: offered beside the email form; a closed window changes nothing, an answer signs in
-  run('S.signed_in=false;S.me=null;S.auth.mode="login";S.screen="account"');assert.match(run('signInScreen()'),/data-act="auth-telegram"[^>]*>Continue with Telegram/);
-  run('S.auth.mode="forgot"');assert.doesNotMatch(run('signInScreen()'),/auth-telegram/);run('S.auth.mode="login"');
-  await run('act["auth-telegram"]()');assert.equal(run('S.signed_in'),false,'closing the Telegram window does not sign in');assert.equal(run('S.authBusy'),false);
-  telegramAnswers=true;await run('act["auth-telegram"]()');assert.equal(run('S.signed_in'),true);assert.equal(run('S.me.id'),1);assert.equal(run('S.screen'),'home');telegramAnswers=false;
-  run('S.signed_in=false;S.auth.mode="register"');assert.match(run('signInScreen()'),/id="terms"/);assert.match(run('signInScreen()'),/id="personal-data"/);
-  query('#terms').checked=true;query('#personal-data').checked=true;
-  await handlers.submit[0]({target:{id:'register',querySelector:()=>element()},preventDefault(){}});
-  assert.equal(run('S.auth.mode'),'verify');assert(calls.some(([name,args])=>name==='cabinet_auth'&&args.action==='register'&&args.body.accept_terms&&args.body.accept_personal_data));
-  query('#code').value='123456';await handlers.submit[0]({target:{id:'verify',querySelector:()=>element()},preventDefault(){}});assert.equal(run('S.signed_in'),true);
-  run('S.signed_in=false;S.auth.mode="forgot"');await handlers.submit[0]({target:{id:'forgot',querySelector:()=>element()},preventDefault(){}});assert.equal(run('S.auth.mode'),'reset');
-  query('#reset-link').value='https://example.invalid/reset?token=fixture-reset-token';query('#password').value='another-fixture-password';
-  await handlers.submit[0]({target:{id:'reset',querySelector:()=>element()},preventDefault(){}});
-  assert(calls.some(([name,args])=>name==='cabinet_auth'&&args.action==='reset'&&args.body.token==='fixture-reset-token'));assert.equal(run('S.signed_in'),true);
-  run('S.signed_in=false;S.activeSub=null');query('#email').value='fixture@example.invalid';query('#password').value='fixture-password';
-  await handlers.submit[0]({target:{id:'login',querySelector:()=>element()},preventDefault(){}});
+  // Sign-in: tiles for the methods the server offers, no passwords anywhere.
+  run('S.signed_in=false;S.me=null;S.screen="account"');await run('loadMethods(true)');
+  let screen=run('screens.account()');assert.doesNotMatch(screen,/type="password"|API URL|Forgot/);
+  assert.deepEqual([...screen.matchAll(/class="auth-tile"[^>]*data-v="(\w+)"/g)].map(m=>m[1]),['telegram','google','yandex','email'],'one tile per method');
+  assert.match(screen,/class="auth-lockup"/,'the logo sits above the tiles');
+  // Browser hand-off: the app shows the code to type in the browser, then a poll signs in.
+  run('act["auth-method"]({dataset:{v:"google"}})');assert.match(run('signInScreen()'),/data-act="auth-oauth" data-v="google"[^>]*>[\s\S]*Continue with Google/);
+  await run('act["auth-oauth"]({dataset:{v:"google"}})');assert(calls.some(([name,args])=>name==='cabinet_oauth_start'&&args.provider==='google'));
+  assert.match(run('signInScreen()'),/4831/,'the confirmation code is shown');
+  await run('pollOAuth()');assert.equal(run('S.signed_in'),false,'pending does not sign in');
+  run('act["auth-oauth-cancel"]()');assert(calls.some(([name])=>name==='cabinet_oauth_cancel'));assert.doesNotMatch(run('signInScreen()'),/4831/);
+  const pollsBefore=calls.filter(([name])=>name==='cabinet_oauth_poll').length;await run('pollOAuth()');assert.equal(calls.filter(([name])=>name==='cabinet_oauth_poll').length,pollsBefore,'cancel stops polling');
+  await run('act["auth-oauth"]({dataset:{v:"telegram"}})');pollAnswers.push({status:'signed_in'});await run('pollOAuth()');
+  assert.equal(run('S.signed_in'),true);assert.equal(run('S.screen'),'home');assert.equal(storage['akimov:last-login'],'telegram');
+  // Email: address → code → signed in for an existing account.
+  run('S.signed_in=false;S.me=null;S.screen="account";act["auth-method"]({dataset:{v:"email"}})');assert.match(run('signInScreen()'),/id="email-code"[\s\S]*Get code/);
+  query('#email').value='fixture@example.invalid';await handlers.submit[0]({target:{id:'email-code',querySelector:()=>element()},preventDefault(){}});
+  assert.equal(run('S.auth.step'),'code');screen=run('signInScreen()');assert.match(screen,/id="email-verify"/);assert.match(screen,/fixture@example\.invalid/);
+  assert.match(screen,/data-act="auth-email-resend"[^>]*disabled[^>]*>New code in \d+ s/,'resend waits a minute');
+  run('S.auth.sentAt=Date.now()-61000');assert.match(run('signInScreen()'),/data-act="auth-email-resend"(?![^>]*disabled)[^>]*>Send a new code/);
+  query('#code').value='123456';await handlers.submit[0]({target:{id:'email-verify',querySelector:()=>element()},preventDefault(){}});
+  assert(calls.some(([name,args])=>name==='cabinet_auth'&&args.action==='email-verify'&&args.body.email==='fixture@example.invalid'&&args.body.code==='123456'));
   assert.equal(run('S.signed_in'),true);assert.equal(run('S.has_sub'),true,'signing into an existing active plan loads its profile automatically');assert.equal(run('S.engine_sub_id'),run('S.activeSub'));assert(run('NODES.length')>0);
+  assert.equal(storage['akimov:last-login'],'email');assert(!Object.values(storage).some(value=>value.includes('123456')),'codes never enter frontend storage');
+  // A new address: consents only after its code, then the account.
+  run('S.signed_in=false;S.me=null;S.screen="account";act["auth-method"]({dataset:{v:"email"}})');assert.doesNotMatch(run('signInScreen()'),/id="terms"/);
+  query('#email').value='new@example.invalid';await handlers.submit[0]({target:{id:'email-code',querySelector:()=>element()},preventDefault(){}});
+  assert.doesNotMatch(run('signInScreen()'),/id="terms"/,'no consents before the code');
+  query('#code').value='654321';await handlers.submit[0]({target:{id:'email-verify',querySelector:()=>element()},preventDefault(){}});
+  assert.equal(run('S.auth.step'),'consent');screen=run('signInScreen()');assert.match(screen,/id="terms"/);assert.match(screen,/id="personal-data"/);assert.match(screen,/Create account/);
+  query('#terms').checked=true;query('#personal-data').checked=true;await handlers.submit[0]({target:{id:'email-create',querySelector:()=>element()},preventDefault(){}});
+  assert(calls.some(([name,args])=>name==='cabinet_auth'&&args.action==='email-create'&&args.body.accept_terms===true&&args.body.accept_personal_data===true));assert.equal(run('S.signed_in'),true);
+  // Email sign-ups off but mail working: no email tile, a quiet way in for email accounts.
+  methods={telegram:true,google:false,yandex:false,email:false,email_signin:true};run('S.signed_in=false;S.screen="account"');await run('loadMethods(true)');
+  screen=run('signInScreen()');assert.doesNotMatch(screen,/class="auth-tile"/,'one method needs no tiles');assert.match(screen,/data-act="auth-email-open"/);
+  run('act["auth-email-open"]()');assert.match(run('signInScreen()'),/id="email-code"/);
+  methods.email_signin=false;await run('loadMethods(true)');assert.doesNotMatch(run('signInScreen()'),/auth-email-open|id="email-code"/,'no email way in without mail');
+  // Methods endpoint down: the last methods received and a note.
+  methodsDown=true;await run('loadMethods(true)');screen=run('signInScreen()');assert.match(screen,/Can.t reach the server/);assert.match(screen,/data-act="auth-oauth" data-v="telegram"/);
+  methodsDown=false;methods={telegram:true,google:true,yandex:true,email:true,email_signin:true};await run('loadMethods(true)');
   run('S.has_sub=true;S.screen="settings"');await run('act["subscription-refresh"]()');assert.equal(run('S.profile.title'),'Fixture profile');assert.equal(run('S.profile.total'),0);
   const html=fs.readFileSync(path.join(__dirname,'../ui/index.html'),'utf8');assert.doesNotMatch(html,/<script>(?!\s*$)|fonts\.googleapis|id="brand"|class="proto"/);
   assert.doesNotMatch(source,/setInterval\(tick|pay-sim|function settlePay|anna@example|function seed\(|cabinet_configure|id="service"/);

@@ -22,82 +22,34 @@ fn cabinet_boot(c: Cab, e: Eng) -> Result<Value, String> {
     c.boot()
 }
 
+/// Opens the provider in the system browser and returns the code to type on the callback page.
 #[tauri::command(async)]
-fn cabinet_login(
-    c: Cab,
-    e: Eng,
-    gate: Gate,
-    email: String,
-    password: String,
-) -> Result<Value, String> {
+fn cabinet_oauth_start(c: Cab, e: Eng, provider: String) -> Result<Value, String> {
+    c.set_proxy(e.proxy_port());
+    let (url, answer) = c.oauth_start(&provider)?;
+    if let Err(error) = open_https(&url) {
+        c.oauth_cancel();
+        return Err(error);
+    }
+    Ok(answer)
+}
+/// One look at the browser sign-in; a session it brings replaces the previous account's subscription.
+#[tauri::command(async)]
+fn cabinet_oauth_poll(c: Cab, e: Eng, gate: Gate) -> Result<Value, String> {
     let _guard = gate.0.lock().map_err(|_| "Account operation failed.")?;
-    let result = c.login(&email, &password)?;
-    let stopped = e.disconnect();
-    let forgotten = e.forget_subscription();
-    stopped?;
-    forgotten?;
+    c.set_proxy(e.proxy_port());
+    let result = c.oauth_poll()?;
+    if result["status"] == "signed_in" {
+        let stopped = e.disconnect();
+        let forgotten = e.forget_subscription();
+        stopped?;
+        forgotten?;
+    }
     Ok(result)
 }
-/// Telegram's official sign-in, the same one the cabinet uses, in its own window.
-/// Returns the account, or null when the window was closed without signing in.
 #[tauri::command(async)]
-fn cabinet_telegram_login(
-    app: tauri::AppHandle,
-    c: Cab,
-    e: Eng,
-    gate: Gate,
-) -> Result<Value, String> {
-    const REFUSED: &str = "Telegram sign-in was not completed. Try again.";
-    c.set_proxy(e.proxy_port());
-    let challenge = c.telegram_challenge()?;
-    if let Some(old) = app.get_webview_window("telegram") {
-        let _ = old.destroy();
-    }
-    let (done, answers) = std::sync::mpsc::channel::<Option<String>>();
-    let closed = done.clone();
-    let callback = challenge.callback_url();
-    let state = challenge.state().to_owned();
-    let window = tauri::WebviewWindowBuilder::new(
-        &app,
-        "telegram",
-        tauri::WebviewUrl::External(challenge.url.clone()),
-    )
-    .title("Sign in with Telegram")
-    .inner_size(520.0, 720.0)
-    .center()
-    .on_navigation(move |url| {
-        if url.origin() == callback.origin() && url.path() == callback.path() {
-            if let Some(answer) = cabinet::telegram_callback(url, &callback, &state) {
-                let _ = done.send(answer);
-            }
-            return false;
-        }
-        // The window stays on Telegram's own pages.
-        url.origin().ascii_serialization() == "https://oauth.telegram.org"
-    })
-    .build()
-    .map_err(|_| "Could not open the Telegram sign-in window.")?;
-    window.on_window_event(move |event| {
-        if matches!(event, tauri::WindowEvent::Destroyed) {
-            let _ = closed.send(None);
-        }
-    });
-    let answer = answers
-        .recv_timeout(std::time::Duration::from_secs(challenge.expires))
-        .ok()
-        .flatten();
-    let _ = window.destroy();
-    let Some(answer) = answer else {
-        return Ok(Value::Null);
-    };
-    let message: Value = serde_json::from_str(&answer).map_err(|_| REFUSED)?;
-    let _guard = gate.0.lock().map_err(|_| "Account operation failed.")?;
-    let me = c.telegram_complete(&challenge, &message)?;
-    let stopped = e.disconnect();
-    let forgotten = e.forget_subscription();
-    stopped?;
-    forgotten?;
-    Ok(me)
+fn cabinet_oauth_cancel(c: Cab) {
+    c.oauth_cancel();
 }
 #[tauri::command(async)]
 fn cabinet_request(
@@ -160,7 +112,9 @@ fn clear_subscription(e: Eng, gate: Gate, expected_sub_id: Option<u64>) -> Resul
 }
 #[tauri::command(async)]
 fn open_external(url: String) -> Result<(), String> {
-    let parsed = url::Url::parse(&url).map_err(|_| "Invalid link.")?;
+    open_https(&url::Url::parse(&url).map_err(|_| "Invalid link.")?)
+}
+fn open_https(parsed: &url::Url) -> Result<(), String> {
     if parsed.scheme() != "https"
         || parsed.host_str().is_none()
         || !parsed.username().is_empty()
@@ -400,8 +354,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             boot,
             cabinet_boot,
-            cabinet_login,
-            cabinet_telegram_login,
+            cabinet_oauth_start,
+            cabinet_oauth_poll,
+            cabinet_oauth_cancel,
             cabinet_auth,
             cabinet_request,
             cabinet_logout,

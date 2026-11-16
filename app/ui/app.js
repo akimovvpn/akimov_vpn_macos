@@ -71,7 +71,7 @@ let uid=10;
 const S={v:1,logo:3,screen:"home",conn:"idle",secs:0,mode:"tun",node:"",balance:0,activeSub:null,pendingSwitch:null,
   subs:[],devices:{},deviceLoaded:{},rules:[],conns:[],paused:false,filter:"all",q:"",scopeFor:null,applied:"Applied",
   comp:{type:"DOMAIN-SUFFIX",value:"",target:"@direct",raw:false},pay:null,sheet:null,edit:null,just:null,
-  auth:{mode:"login",email:"",retryAt:0},authBusy:false,restoring:true,me:null,cabinet:null,has_sub:false,hwid:"",busy:false,version:"",signed_in:false,
+  auth:{method:null,step:"email",email:"",sentAt:0,oauth:null,methods:null,offline:false,emailOpen:false},authBusy:false,restoring:true,me:null,cabinet:null,has_sub:false,hwid:"",busy:false,version:"",signed_in:false,
   transactions:null,historyLoading:false,historyError:"",legal:null,legalLoading:false,legalError:""};
 let historyGeneration=0;
 const flagCodes=new Set(["EU","EE","LV","LT","FI","SE","PL","NL","DE","FR","GB","US","RU","TR","UA","KZ","CH","AT","BE","CZ","DK","NO","ES","IT","PT","IE","RO","CA","AU","JP","SG","HK","IN","GE","AM","IL","AE"]);
@@ -601,14 +601,13 @@ S.from={};
 const updateRow=()=>inforow("App updates","Install new macOS releases manually.");
 function friendlyError(error){
  if(/device identification/i.test(String(error?.message||error)))return "Device identification is unavailable. Restart macOS and try again.";
- if(/^Telegram sign-in|Telegram sign-in window/.test(String(error?.message||error)))return String(error?.message||error);
  const text=String(error?.message||error||'');
  if(/add route:.*file exists|tun_route_conflict/i.test(text))return 'Another VPN is using whole-device routes. Disconnect it, then connect again.';
  if(/TUN adapter could not start/i.test(text))return /permission denied|not permitted/i.test(text)?'The VPN adapter needs administrator access. Reinstall the network helper and try again.':'The macOS VPN adapter could not start. Disconnect other VPNs and try again.';
  if(/wrong.*(email|password)|incorrect.*(email|password)|invalid credentials|неверн.*парол/i.test(text))return 'Wrong email or password.';
  if(/sign in again|session expired|HTTP 401|not signed in/i.test(text))return 'Please sign in again.';
  if(/already registered|email.*registered|email уже/i.test(text))return 'This email is already registered. Try signing in.';
- if(/code.*expired|link.*expired|устарел|истек/i.test(text))return 'This code or reset link has expired. Request a new one.';
+ if(/code.*expired|устарел|истек/i.test(text))return 'This code has expired. Request a new one.';
  if(/code.*incorrect|incorrect.*code|six-digit|неверн.*код/i.test(text))return 'That code is incorrect. Try again.';
  if(/valid email/i.test(text))return 'Enter a valid email address.';
  if(/password.*8.*128/i.test(text))return 'Use a password between 8 and 128 characters.';
@@ -694,7 +693,7 @@ async function loadTariffs(){
   const result=await api("GET","/tariffs");
   TARIFFS.splice(0,TARIFFS.length,...result.tariffs.map(t=>({...t,price:t.price_kopecks,gb:t.traffic_gb})));
 }
-function paintScreen(screen){if(S.screen!==screen||S.edit||!S.signed_in&&$("#main form.auth"))return;const m=$("#main");if(m.classList.contains("enter")){pendingPaint=screen;return}if(!m.classList.contains("leave"))render()}
+function paintScreen(screen){if(S.screen!==screen||S.edit||!S.signed_in&&$("#main .auth-form"))return;const m=$("#main");if(m.classList.contains("enter")){pendingPaint=screen;return}if(!m.classList.contains("leave"))render()}
 async function refreshScreen(screen){
   if(screen==="settings")await loadLegal();
   if(!S.signed_in)return;
@@ -742,15 +741,49 @@ async function useSubscription(id){
 }
 async function watchTraffic(){await invoke("watch",{on:S.screen==="conns"&&S.conn==="connected"&&!S.paused&&!document.hidden})}
 function legalLink(key,label){const doc=S.legal?.docs.find(d=>d.key===key);return `<a class="legal-link" href="${esc(doc?.url||'#')}" data-act="legal-link" data-key="${key}">${label}</a>`}
+/* Sign-in: the methods the server offers, a browser hand-off confirmed with a short code, or an emailed code. No passwords. */
+const LOGIN_ORDER=["telegram","google","yandex","email"],LOGIN_NAME={telegram:"Telegram",google:"Google",yandex:"Yandex ID",email:"Email"};
+const LOGIN_ICON={
+ telegram:'<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path fill="#2AABEE" stroke="none" d="M21.2 4.4 2.9 11.5c-1.2.5-1.2 1.2-.2 1.5l4.7 1.5 1.8 5.5c.2.6.4.8.9.8.4 0 .6-.2.9-.4l2.3-2.2 4.7 3.5c.9.5 1.5.2 1.7-.8l3.1-14.5c.3-1.3-.5-1.9-1.6-1.5Z"/></svg>',
+ google:'<svg class="ic" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" stroke="none" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" stroke="none" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" stroke="none" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" stroke="none" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>',
+ yandex:'<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="11" fill="#FC3F1D" stroke="none"/><text x="12" y="16.6" text-anchor="middle" font-family="Arial,sans-serif" font-weight="700" font-size="13" fill="#fff" stroke="none">Я</text></svg>',
+ email:'<svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="4.5" width="15" height="11" rx="2"/><path d="m3 5.5 7 5.5 7-5.5"/></svg>'
+};
+let methodsLoading=false,oauthTimer=0,oauthSeq=0,resendTimer=0;
+const lastLogin=()=>{try{return localStorage.getItem("akimov:last-login")}catch{return null}};
+const rememberLogin=m=>{try{localStorage.setItem("akimov:last-login",m)}catch{}};
+async function loadMethods(force=false){
+ if(methodsLoading||S.auth.methods&&!force)return;methodsLoading=true;
+ try{
+  const m=await api("GET","/auth/methods"),next={};for(const k of [...LOGIN_ORDER,"email_signin"])next[k]=m?.[k]===true;
+  S.auth.methods=next;S.auth.offline=false;try{localStorage.setItem("akimov:login-methods",JSON.stringify(next))}catch{}
+ }catch{
+  /* Nothing signs in offline anyway: show what the server last offered, or every method */
+  let saved=null;try{saved=JSON.parse(localStorage.getItem("akimov:login-methods"))}catch{}
+  S.auth.methods=saved&&typeof saved==="object"?saved:{telegram:true,google:true,yandex:true,email:true,email_signin:true};S.auth.offline=true;
+ }finally{methodsLoading=false;if(!S.signed_in)paintScreen("account")}
+}
+function emailPanel(){
+ const a=S.auth,busy=S.authBusy?"disabled":"";
+ if(a.step==="code"){const wait=Math.max(0,Math.ceil((a.sentAt+60000-Date.now())/1000));
+  return `<form id="email-verify" class="auth-form"><p class="cap">We sent a code to <b>${esc(a.email)}</b>.</p><label for="code">Code from the email</label><input class="input mono auth-code" id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required><button class="btn primary block" type="submit" ${busy}>Sign in</button><div class="auth-row"><button type="button" class="auth-link" data-act="auth-email-change">Change email</button><button type="button" class="auth-link" data-act="auth-email-resend" ${wait>0?"disabled":""}>${wait>0?`New code in ${wait} s`:"Send a new code"}</button></div><p class="cap dim auth-hint">No email? Check your spam folder.</p></form>`}
+ if(a.step==="consent")return `<form id="email-create" class="auth-form"><p class="cap">There's no account for <b>${esc(a.email)}</b> yet. Accept the terms to create one.</p><label class="consent"><input type="checkbox" id="terms" required><span>I accept the ${legalLink('offer','public offer')} and ${legalLink('terms','terms of service')}.</span></label><label class="consent"><input type="checkbox" id="personal-data" required><span>I consent to ${legalLink('consent','processing of my personal data')} and have read the ${legalLink('privacy','privacy policy')}.</span></label><button class="btn primary block" type="submit" disabled>Create account</button><div class="auth-row center"><button type="button" class="auth-link" data-act="auth-email-change">Back</button></div></form>`;
+ return `<form id="email-code" class="auth-form"><label for="email">Email</label><input class="input" id="email" type="email" autocomplete="email" value="${esc(a.email)}" required><button class="btn primary block" type="submit" ${busy}>Get code</button><p class="cap dim auth-hint">We'll email you a code. No password needed.</p></form>`;
+}
 function signInScreen(){
- const mode=S.auth.mode,email=`<label for="email">Email</label><input class="input" id="email" type="email" autocomplete="email" value="${esc(S.auth.email)}" required>`;
- const password=`${mode==='login'?'<div class="auth-label-row"><label for="password">Password</label><a class="auth-link" href="#" data-act="auth" data-v="forgot">Forgot password?</a></div>':`<label for="password">${mode==='reset'?'New password':'Password'}</label>`}<input class="input" id="password" type="password" minlength="8" maxlength="128" autocomplete="${mode==='login'?'current-password':'new-password'}" required>`;
- const title={login:'Sign in',register:'Create account',verify:'Check your email',forgot:'Reset password',reset:'Set a new password'}[mode];
- let fields=mode==='verify'?`<p class="cap">Enter the six-digit code sent to ${esc(S.auth.email)}.</p><label for="code">Email code</label><input class="input mono" id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>`:mode==='reset'?`<p class="cap">Copy the reset link from your email and paste it here to set your new password.</p><label for="reset-link">Reset link or token</label><input class="input" id="reset-link" type="text" autocomplete="off" spellcheck="false" required>${password}`:email+(mode==='forgot'?'':password);
- if(mode==='register')fields+=`<label class="consent"><input type="checkbox" id="terms" required><span>I accept the ${legalLink('offer','public offer')} and ${legalLink('terms','terms of service')}.</span></label><label class="consent"><input type="checkbox" id="personal-data" required><span>I consent to ${legalLink('consent','processing of my personal data')} and have read the ${legalLink('privacy','privacy policy')}.</span></label>`;
- const button={login:'Sign in',register:'Create account',verify:'Verify email',forgot:'Send reset link',reset:'Save password'}[mode];
- const switcher=mode==='login'?'New here? <a class="auth-link accent" href="#" data-act="auth" data-v="register">Create account</a>':mode==='register'?'Already have an account? <a class="auth-link accent" href="#" data-act="auth" data-v="login">Sign in</a>':'<a class="auth-link" href="#" data-act="auth" data-v="login">Back to sign in</a>';
- return `<section class="auth-wrap"><form id="${mode}" class="card pad auth"><h1 class="auth-title">${title}</h1>${fields}<button class="btn primary block" style="margin-top:20px" type="submit" ${S.authBusy?'disabled':''}>${button}</button>${mode==='login'||mode==='register'?`<button class="btn block" style="margin-top:10px" type="button" data-act="auth-telegram" ${S.authBusy?'disabled':''}>Continue with Telegram</button>`:''}<div class="auth-switch">${switcher}${mode==='verify'?` · <button class="auth-link" type="button" data-act="auth-resend" ${Date.now()<S.auth.retryAt?'disabled':''}>Resend code</button>`:''}</div></form></section>`;
+ const a=S.auth,m=a.methods;if(!m&&!methodsLoading)void loadMethods();
+ const lockup=`<div class="auth-lockup">${markSVG(S.logo)}<span class="word">${VAR[S.v].word}</span></div>`;
+ if(!m)return `<section class="auth-wrap"><div class="auth-col">${lockup}<div class="auth-panel">${sk("100%",44)}</div></div></section>`;
+ const enabled=LOGIN_ORDER.filter(k=>m[k]),last=lastLogin();
+ const current=a.emailOpen&&!m.email&&m.email_signin?"email":enabled.includes(a.method)?a.method:enabled.includes(last)?last:enabled[0];
+ const tiles=enabled.length>1?`<div class="auth-tiles" role="group" aria-label="Sign-in method" style="--n:${enabled.length}">${enabled.map(k=>`<button type="button" class="auth-tile" data-act="auth-method" data-v="${k}" aria-pressed="${k===current}" ${a.oauth||S.authBusy?"disabled":""}>${last===k?'<span class="auth-badge">Last used</span>':""}${LOGIN_ICON[k]}<span>${LOGIN_NAME[k]}</span></button>`).join("")}</div>`:"";
+ let panel="";
+ if(current==="email")panel=emailPanel();
+ else if(current&&a.oauth)panel=`<div class="auth-wait" role="status"><p class="cap">Enter this code in your browser to finish signing in with ${LOGIN_NAME[a.oauth.provider]}:</p><div class="auth-confirm">${esc(a.oauth.confirm)}</div><p class="cap dim">Waiting for your browser…</p><div class="auth-row"><button type="button" class="btn" data-act="auth-oauth-cancel">Cancel</button><button type="button" class="btn quiet" data-act="auth-oauth" data-v="${a.oauth.provider}">Start again</button></div></div>`;
+ else if(current)panel=`<button type="button" class="btn primary block auth-provider" data-act="auth-oauth" data-v="${current}" ${S.authBusy?"disabled":""}>${LOGIN_ICON[current]}<span>Continue with ${LOGIN_NAME[current]}</span></button><p class="cap dim auth-hint">Opens your browser. You'll confirm there with a short code.</p>`;
+ const quiet=!m.email&&m.email_signin&&current!=="email"?'<button type="button" class="auth-link auth-email-link" data-act="auth-email-open">Sign in with email</button>':"";
+ const note=a.offline?'<p class="cap auth-note" role="status">Can’t reach the server. Check your connection and try again.</p>':"";
+ return `<section class="auth-wrap"><div class="auth-col">${lockup}${note}${tiles}<div class="auth-panel">${panel}</div>${quiet}</div></section>`;
 }
 
 act['subscription-refresh']=async()=>{if(S.refreshing||S.testing||!S.has_sub)return;S.refreshing=true;if(S.sheet==="nodes")renderSheet();if(S.screen==='settings'||S.screen==='subs')rr();try{engineBoot(await invoke('refresh_subscription'));await loadNodes();toast('Subscription updated.')}catch(error){report(error)}finally{S.refreshing=false;if(S.sheet==="nodes")renderSheet();if(S.screen==='settings'||S.screen==='subs')rr()}};
@@ -895,14 +928,29 @@ Object.assign(act,{
     }finally{S.deviceBusy=false;for(const control of $$('[data-act^="dev-"],[data-act="switch"],[data-act="switch-ok"]'))control.disabled=false;if(el.isConnected)el.disabled=false}
   }
 });
-let resendTimer=0;
-async function signedIn(me){engineBoot(await invoke('boot'));applyMe(me);S.auth.mode='login';go('home');paintScreen('home');if(await ensureSubscription())await loadNodes()}
-/* Telegram's own page opens in a separate window; a closed window answers null and changes nothing */
-act['auth-telegram']=async()=>{if(S.authBusy)return;S.authBusy=true;rr();try{const me=await invoke('cabinet_telegram_login');if(me)await signedIn(me)}catch(error){report(error)}finally{S.authBusy=false;if(!S.signed_in)rr()}};
-act.auth=el=>{if(S.authBusy)return;pendingPaint=null;const input=$('#email');if(input)S.auth.email=input.value.trim();S.auth.mode=el.dataset.v;rr()};
-act['auth-resend']=async()=>{if(S.authBusy||Date.now()<S.auth.retryAt)return;S.authBusy=true;try{await invoke('cabinet_auth',{action:'resend',body:{email:S.auth.email}});S.auth.retryAt=Date.now()+60000;toast('A new code has been sent.');clearTimeout(resendTimer);resendTimer=setTimeout(()=>{if(!S.signed_in&&S.auth.mode==='verify')rr()},60000)}catch(error){report(error)}finally{S.authBusy=false;rr()}};
+async function signedIn(me){stopOAuth(false);S.auth.step='email';S.auth.emailOpen=false;engineBoot(await invoke('boot'));applyMe(me);go('home');paintScreen('home');if(await ensureSubscription())await loadNodes()}
+function stopOAuth(tell=true){oauthSeq++;clearTimeout(oauthTimer);if(S.auth.oauth&&tell)void invoke('cabinet_oauth_cancel').catch(()=>{});S.auth.oauth=null}
+/* The browser finishes the sign-in; the app asks every 1.5 s. A finished sign-in always counts, a stale answer otherwise changes nothing */
+async function pollOAuth(seq=oauthSeq){
+ if(seq!==oauthSeq||!S.auth.oauth||S.signed_in)return;
+ const provider=S.auth.oauth.provider;let result;
+ try{result=await invoke('cabinet_oauth_poll')}catch(error){if(seq!==oauthSeq)return;S.auth.oauth=null;report(error);rr();return}
+ if(result?.status==='signed_in'){rememberLogin(provider);await signedIn(result.me);return}
+ if(seq!==oauthSeq)return;
+ if(result?.status==='expired'){S.auth.oauth=null;toast('The sign-in request expired. Start again.');rr();return}
+ oauthTimer=setTimeout(()=>pollOAuth(seq),1500);
+}
+function tickResend(){clearInterval(resendTimer);resendTimer=setInterval(()=>{const b=$('[data-act="auth-email-resend"]'),wait=Math.max(0,Math.ceil((S.auth.sentAt+60000-Date.now())/1000));if(S.signed_in||S.auth.step!=='code'||!b){clearInterval(resendTimer);return}b.disabled=wait>0;b.textContent=wait>0?`New code in ${wait} s`:'Send a new code';if(!wait)clearInterval(resendTimer)},1000)}
+act['auth-method']=el=>{if(S.authBusy||S.auth.oauth)return;S.auth.method=el.dataset.v;S.auth.emailOpen=false;rr()};
+act['auth-oauth']=async el=>{if(S.authBusy)return;const provider=el.dataset.v;stopOAuth(false);S.authBusy=true;rr();
+ try{const result=await invoke('cabinet_oauth_start',{provider});S.auth.oauth={provider,confirm:String(result.confirm_code||'')};S.auth.method=provider;const seq=oauthSeq;oauthTimer=setTimeout(()=>pollOAuth(seq),1500)}
+ catch(error){report(error)}finally{S.authBusy=false;if(!S.signed_in)rr()}};
+act['auth-oauth-cancel']=()=>{stopOAuth();rr()};
+act['auth-email-open']=()=>{S.auth.emailOpen=true;rr()};
+act['auth-email-change']=()=>{if(S.authBusy)return;S.auth.step='email';rr()};
+act['auth-email-resend']=async el=>{if(S.authBusy||Date.now()<S.auth.sentAt+60000)return;S.authBusy=true;el.disabled=true;try{await invoke('cabinet_auth',{action:'email-code',body:{email:S.auth.email}});S.auth.sentAt=Date.now();toast('A new code has been sent.');tickResend()}catch(error){report(error)}finally{S.authBusy=false;if(!S.signed_in)rr()}};
 document.addEventListener('submit',async event=>{
- const form=event.target;if(!['login','register','verify','forgot','reset','promo'].includes(form.id))return;event.preventDefault();if(S.authBusy)return;
+ const form=event.target;if(!['email-code','email-verify','email-create','promo'].includes(form.id))return;event.preventDefault();if(S.authBusy)return;
  const button=form.querySelector('button[type="submit"]')||form.querySelector('button');button.disabled=true;button.classList.add('loading');S.authBusy=true;
  try{
   if(form.id==='promo'){
@@ -910,17 +958,13 @@ document.addEventListener('submit',async event=>{
     await api('POST','/promo',{code});await refreshMe();toast('Promo code applied.');
     if(S.sheet==='promo'&&$('#promo')===form)closeSheet();paintScreen(S.screen);return
   }
-  const email=$('#email')?.value.trim()||S.auth.email,password=$('#password')?.value||'';let result;
-  if(form.id==='login'){result={me:await invoke('cabinet_login',{email,password})}}
-  else{let body={email};if(form.id==='register')body={email,password,accept_terms:$('#terms').checked,accept_personal_data:$('#personal-data').checked};if(form.id==='verify')body={email:S.auth.email,code:$('#code').value.trim()};if(form.id==='reset'){let token=$('#reset-link').value.trim();if(/^https?:\/\//i.test(token)){const link=new URL(token);if(link.origin!==new URL(S.cabinet.cabinet_url).origin)throw Error('invalid reset link');token=link.searchParams.get('token')||''}body={token,password}}result=await invoke('cabinet_auth',{action:form.id,body})}
-  S.auth.email=email;
-  if(result.me)await signedIn(result.me)
-  else if(form.id==='register'){S.auth.mode='verify';S.auth.email=result.email||email;toast('Check your email for a verification code.');rr()}
-  else if(form.id==='forgot'){S.auth.mode='reset';rr()}
- }catch(error){report(error)}finally{S.authBusy=false;if(button.isConnected){button.disabled=false;button.classList.remove('loading')}const current=$('form.auth button[type="submit"]');if(current)current.disabled=false}
+  if(form.id==='email-code'){const email=$('#email').value.trim();await invoke('cabinet_auth',{action:'email-code',body:{email}});S.auth.email=email;S.auth.step='code';S.auth.sentAt=Date.now();rr();tickResend();return}
+  if(form.id==='email-verify'){const result=await invoke('cabinet_auth',{action:'email-verify',body:{email:S.auth.email,code:$('#code').value.trim()}});if(result.me){rememberLogin('email');await signedIn(result.me)}else{S.auth.step='consent';void loadLegal();rr()}return}
+  const result=await invoke('cabinet_auth',{action:'email-create',body:{accept_terms:$('#terms').checked,accept_personal_data:$('#personal-data').checked}});rememberLogin('email');await signedIn(result.me);
+ }catch(error){report(error)}finally{S.authBusy=false;if(button.isConnected){button.disabled=false;button.classList.remove('loading')}const current=$('.auth-form:not(#email-create) button[type="submit"]');if(current)current.disabled=false}
 });
 
-document.addEventListener("change",event=>{if(event.target.id==="topup-amount"&&S.pay&&!S.pay.busy){S.pay.amount=Math.round(Number(event.target.value)*100);renderSheet()}});
+document.addEventListener("change",event=>{if(event.target.id==="terms"||event.target.id==="personal-data"){const ok=$("#terms")?.checked&&$("#personal-data")?.checked,b=$("#email-create button[type=submit]");if(b)b.disabled=!ok||S.authBusy}if(event.target.id==="topup-amount"&&S.pay&&!S.pay.busy){S.pay.amount=Math.round(Number(event.target.value)*100);renderSheet()}});
 document.addEventListener("visibilitychange",()=>{if(document.hidden){cancelAnimationFrame(frameHandle);frameHandle=0;stopPaymentPoll()}else{startAnimation();if(S.pay?.step==="wait"&&S.sheet==="pay")checkPayment().catch(report);refreshScreen(S.screen).catch(background)}watchTraffic().catch(report)});
 async function hideSplash(){
   const splash=$("#splash");
