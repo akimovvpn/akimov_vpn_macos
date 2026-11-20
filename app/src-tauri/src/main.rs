@@ -33,19 +33,34 @@ fn cabinet_oauth_start(c: Cab, e: Eng, provider: String) -> Result<Value, String
     }
     Ok(answer)
 }
-/// One look at the browser sign-in; a session it brings replaces the previous account's subscription.
-#[tauri::command(async)]
-fn cabinet_oauth_poll(c: Cab, e: Eng, gate: Gate) -> Result<Value, String> {
-    let _guard = gate.0.lock().map_err(|_| "Account operation failed.")?;
+/// The cabinet's callback page hands the browser sign-in back through akimovvpn://. A session it
+/// brings replaces the previous account's subscription; the window hears the outcome as "oauth".
+fn finish_browser_sign_in(app: &tauri::AppHandle, link: &url::Url) {
+    let (c, e) = (
+        app.state::<cabinet::Cabinet>(),
+        app.state::<Arc<core::Engine>>(),
+    );
+    let gate = app.state::<AccountGate>();
+    let Ok(_guard) = gate.0.lock() else {
+        return;
+    };
     c.set_proxy(e.proxy_port());
-    let result = c.oauth_poll()?;
-    if result["status"] == "signed_in" {
-        let stopped = e.disconnect();
-        let forgotten = e.forget_subscription();
-        stopped?;
-        forgotten?;
+    let outcome = match c.oauth_finish(link) {
+        Ok(None) => return,
+        Ok(Some(result)) => {
+            let stopped = e.disconnect().err();
+            match stopped.or(e.forget_subscription().err()) {
+                None => result,
+                Some(error) => serde_json::json!({"status": "error", "message": error}),
+            }
+        }
+        Err(error) => serde_json::json!({"status": "error", "message": error}),
+    };
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
     }
-    Ok(result)
+    let _ = app.emit("oauth", outcome);
 }
 #[tauri::command(async)]
 fn cabinet_oauth_cancel(c: Cab) {
@@ -355,7 +370,6 @@ fn main() {
             boot,
             cabinet_boot,
             cabinet_oauth_start,
-            cabinet_oauth_poll,
             cabinet_oauth_cancel,
             cabinet_auth,
             cabinet_request,
@@ -406,6 +420,12 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to start akimov vpn")
         .run(|app, event| {
+            if let tauri::RunEvent::Opened { urls } = &event {
+                for link in urls.iter().filter(|u| u.scheme() == "akimovvpn") {
+                    let (app, link) = (app.clone(), link.clone());
+                    std::thread::spawn(move || finish_browser_sign_in(&app, &link));
+                }
+            }
             if let tauri::RunEvent::Reopen { .. } = event {
                 show_window(app);
             }
