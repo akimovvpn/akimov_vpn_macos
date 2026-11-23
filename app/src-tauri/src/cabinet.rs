@@ -177,8 +177,8 @@ impl Cabinet {
         }))
     }
 
-    /// Starts a sign-in through the system browser. Returns the provider page to open and
-    /// the 4-digit code the person types on the callback page to bind it to this app.
+    /// Starts a sign-in through the system browser. Returns the provider page to open; the
+    /// cabinet's callback page sends the result back through akimovvpn:// (see `oauth_finish`).
     pub fn oauth_start(&self, provider: &str) -> Result<(Url, Value), String> {
         const UNAVAILABLE: &str = "This sign-in method is unavailable right now.";
         if !OAUTH_PROVIDERS.contains(&provider) {
@@ -192,7 +192,7 @@ impl Cabinet {
                 "POST",
                 "/auth/oauth/request",
                 None,
-                Some(&json!({"provider": provider, "client": "desktop"})),
+                Some(&json!({"provider": provider, "client": "app"})),
             )
             .map_err(|e| {
                 if e.status == 0 {
@@ -203,52 +203,74 @@ impl Cabinet {
             })?;
         let request =
             OAuthRequest::parse(provider, &value, &state.saved.cabinet_url).ok_or(UNAVAILABLE)?;
-        let answer = json!({"confirm_code": request.confirm, "expires_in": request.expires});
+        let answer = json!({"expires_in": request.expires});
         let url = request.url.clone();
         state.oauth = Some(request);
         Ok((url, answer))
     }
 
-    /// Asks once whether the browser step finished: pending, signed in, or expired.
-    pub fn oauth_poll(&self) -> Result<Value, String> {
+    /// Finishes the browser sign-in this app started, from the akimovvpn:// link the cabinet's
+    /// callback page opens. `None`: the link is not for the sign-in in progress and changes nothing.
+    pub fn oauth_finish(&self, link: &Url) -> Result<Option<Value>, String> {
         const FAILED: &str = "Sign-in was not completed. Try again.";
+        if link.scheme() != "akimovvpn"
+            || link.host_str() != Some("oauth")
+            || link.path() != "/callback"
+        {
+            return Ok(None);
+        }
+        let mut params = std::collections::HashMap::new();
+        for (key, value) in link.query_pairs() {
+            if params
+                .insert(key.into_owned(), value.into_owned())
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
+        let get = |key: &str| params.get(key).map(String::as_str).unwrap_or("");
+        let (provider, code, error) = (get("provider"), get("code"), get("error"));
         let mut state = self.lock()?;
         let Some(request) = state.oauth.as_ref() else {
-            return Ok(json!({"status": "expired"}));
+            return Ok(None);
         };
+        let code_ok = code.len() <= 4096 && code.bytes().all(|b| b.is_ascii_graphic());
+        if request.provider != provider
+            || request.state != get("state")
+            || code.is_empty() == error.is_empty()
+            || !code_ok
+        {
+            return Ok(None);
+        }
+        let Some(request) = state.oauth.take() else {
+            return Ok(None);
+        };
+        if !error.is_empty() {
+            return Err("Sign-in was cancelled in the browser.".into());
+        }
         if std::time::Instant::now() >= request.deadline {
-            state.oauth = None;
-            return Ok(json!({"status": "expired"}));
+            return Err("The sign-in request expired. Start again.".into());
         }
-        let body = json!({"token": request.token});
-        let value = self.http(
-            &state.saved.base_url,
-            "POST",
-            "/auth/oauth/poll",
-            None,
-            Some(&body),
-        );
-        let value = match value {
-            Ok(value) => value,
-            // A dropped connection or the poll limit: keep waiting; the deadline still ends it.
-            Err(e) if e.status == 0 || e.status == 429 => return Ok(json!({"status": "pending"})),
-            Err(e) => return Err(e.message),
-        };
-        match value["status"].as_str() {
-            Some("pending") => return Ok(json!({"status": "pending"})),
-            Some("confirmed") => {}
-            Some("expired") => {
-                state.oauth = None;
-                return Ok(json!({"status": "expired"}));
-            }
-            _ => {
-                state.oauth = None;
-                return Err(FAILED.into());
-            }
-        }
-        state.oauth = None;
+        let body = json!({"provider": request.provider, "token": request.token, "state": request.state, "code": code});
+        let value = self
+            .http(
+                &state.saved.base_url,
+                "POST",
+                "/auth/oauth/complete",
+                None,
+                Some(&body),
+            )
+            .map_err(|e| {
+                if e.status == 0 {
+                    e.message
+                } else {
+                    FAILED.into()
+                }
+            })?;
         let me = self.adopt(&mut state, value).map_err(|_| FAILED)?;
-        Ok(json!({"status": "signed_in", "me": me}))
+        Ok(Some(
+            json!({"status": "signed_in", "provider": request.provider, "me": me}),
+        ))
     }
 
     pub fn oauth_cancel(&self) {
@@ -576,8 +598,9 @@ const SIGNUP_EXPIRED: &str = "This sign-up has expired. Request a new code.";
 
 /// A browser sign-in the cabinet started for this app.
 pub struct OAuthRequest {
+    provider: String,
     token: String,
-    confirm: String,
+    state: String,
     url: Url,
     expires: u64,
     deadline: std::time::Instant,
@@ -595,14 +618,12 @@ impl OAuthRequest {
         };
         let token = value["token"].as_str()?;
         let state = value["state"].as_str()?;
-        let confirm = value["confirm_code"].as_str()?;
         let expires = value["expires_in"].as_u64()?;
         if !valid_token(token)
             || !valid_token(state)
             || token == state
             || state.len() > 512
-            || confirm.len() != 4
-            || !confirm.bytes().all(|b| b.is_ascii_digit())
+            || !state.starts_with("app.")
             || expires == 0
             || origin(site, false).ok()?.as_str() != site
         {
@@ -651,8 +672,9 @@ impl OAuthRequest {
             return None;
         }
         Some(Self {
+            provider: provider.into(),
             token: token.into(),
-            confirm: confirm.into(),
+            state: state.into(),
             url,
             expires: expires.min(300),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(expires.min(300)),
@@ -983,10 +1005,10 @@ mod tests {
                 "redirect_uri",
                 &format!("https://akimov.bid/auth/{provider}/callback"),
             )
-            .append_pair("state", "server-random-state")
+            .append_pair("state", "app.server-random-state")
             .append_pair("code_challenge", &"a".repeat(43))
             .append_pair("code_challenge_method", "S256");
-        json!({"token":"one-time-request", "state":"server-random-state", "expires_in":300, "confirm_code":"4831", "authorization_url":url.as_str()})
+        json!({"token":"one-time-request", "state":"app.server-random-state", "expires_in":300, "authorization_url":url.as_str()})
     }
 
     #[test]
@@ -995,8 +1017,8 @@ mod tests {
             let request =
                 OAuthRequest::parse(provider, &oauth_value(provider), "https://akimov.bid")
                     .unwrap_or_else(|| panic!("{provider} refused"));
-            assert_eq!(request.confirm, "4831");
             assert_eq!(request.token, "one-time-request");
+            assert_eq!(request.state, "app.server-random-state");
             let url = oauth_value(provider)["authorization_url"]
                 .as_str()
                 .unwrap()
@@ -1010,7 +1032,7 @@ mod tests {
                 url.replace("https:", "http:"),
                 url.replace("https://", "https://user@"),
                 url.clone() + "#x",
-                url.clone() + "&state=server-random-state",
+                url.clone() + "&state=app.server-random-state",
                 url.clone() + "&client_secret=s",
                 url.clone() + "&code_verifier=v",
                 url.replace("%2Fauth%2F", "%2Fother%2F"),
@@ -1029,8 +1051,7 @@ mod tests {
                 );
             }
             for patch in [
-                json!({"confirm_code":"483"}),
-                json!({"confirm_code":"48a1"}),
+                json!({"state":"server-random-state"}),
                 json!({"state":"one-time-request"}),
                 json!({"token":"bad token"}),
                 json!({"expires_in":0}),
@@ -1062,35 +1083,59 @@ mod tests {
     }
 
     #[test]
-    fn oauth_poll_without_a_request_or_after_cancel_never_signs_in() {
-        let dir = scratch("oauth");
+    fn app_link_finishes_only_the_sign_in_this_app_started() {
+        let dir = scratch("oauth-link");
         let cabinet = Cabinet::new(dir.clone());
-        assert_eq!(cabinet.oauth_poll().unwrap()["status"], "expired");
-        cabinet.lock().unwrap().oauth = Some(
-            OAuthRequest::parse("google", &oauth_value("google"), "https://akimov.bid").unwrap(),
-        );
-        cabinet.oauth_cancel();
-        assert_eq!(cabinet.oauth_poll().unwrap()["status"], "expired");
-        assert!(cabinet.oauth_start("github").is_err());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn oauth_poll_rides_out_a_network_blip() {
-        let dir = scratch("oauth-blip");
-        let cabinet = Cabinet::new(dir.clone());
-        {
+        let link = |q: &str| Url::parse(&format!("akimovvpn://oauth/callback?{q}")).unwrap();
+        let ours = "provider=google&state=app.server-random-state&code=c";
+        let start = || {
             let mut state = cabinet.lock().unwrap();
-            let request =
+            state.oauth =
                 OAuthRequest::parse("google", &oauth_value("google"), "https://akimov.bid");
-            state.oauth = request;
             state.saved.base_url = "https://127.0.0.1:9/api/v1".into();
+        };
+        assert_eq!(
+            cabinet.oauth_finish(&link(ours)),
+            Ok(None),
+            "nothing started"
+        );
+        start();
+        for bad in [
+            "provider=yandex&state=app.server-random-state&code=c",
+            "provider=google&state=app.other&code=c",
+            "provider=google&state=app.server-random-state",
+            "provider=google&state=app.server-random-state&code=c&code=d",
+            "provider=google&state=app.server-random-state&code=bad%20code",
+            "provider=google&state=app.server-random-state&code=c&error=access_denied",
+        ] {
+            assert_eq!(cabinet.oauth_finish(&link(bad)), Ok(None), "{bad}");
         }
-        assert_eq!(cabinet.oauth_poll().unwrap()["status"], "pending");
+        for other in [
+            "akimovvpn://other/callback?provider=google&state=app.server-random-state&code=c",
+            "https://akimov.bid/oauth/callback?provider=google&state=app.server-random-state&code=c",
+        ] {
+            assert_eq!(cabinet.oauth_finish(&Url::parse(other).unwrap()), Ok(None), "{other}");
+        }
         assert!(
             cabinet.lock().unwrap().oauth.is_some(),
-            "the browser sign-in is collected later"
+            "a foreign link must not end the sign-in"
         );
+        let refused = link("provider=google&state=app.server-random-state&error=access_denied");
+        assert!(cabinet.oauth_finish(&refused).is_err());
+        assert!(cabinet.lock().unwrap().oauth.is_none(), "a refusal ends it");
+        start();
+        cabinet.oauth_cancel();
+        assert_eq!(cabinet.oauth_finish(&link(ours)), Ok(None), "cancelled");
+        start();
+        assert!(
+            cabinet.oauth_finish(&link(ours)).is_err(),
+            "server unreachable here"
+        );
+        assert!(
+            cabinet.lock().unwrap().oauth.is_none(),
+            "the code is used once"
+        );
+        assert!(cabinet.oauth_start("github").is_err());
         let _ = fs::remove_dir_all(dir);
     }
 

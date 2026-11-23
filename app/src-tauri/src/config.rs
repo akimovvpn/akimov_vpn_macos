@@ -236,9 +236,8 @@ pub fn picker_profile(yaml: &str, main: &str) -> Result<Value, String> {
             let filters = patterns(&group["filter"])?;
             let excludes = patterns(&group["exclude-filter"])?;
             let mut items = group["proxies"].as_sequence().cloned().unwrap_or_default();
-            if group["include-all"].as_bool() == Some(true)
-                || group["include-all-proxies"].as_bool() == Some(true)
-            {
+            let all = group["include-all"].as_bool() == Some(true);
+            if all || group["include-all-proxies"].as_bool() == Some(true) {
                 items.extend(
                     proxies
                         .iter()
@@ -247,6 +246,13 @@ pub fn picker_profile(yaml: &str, main: &str) -> Result<Value, String> {
                         })
                         .map(|(n, _)| Value::from(n.clone())),
                 );
+                // The servers are listed now; the server test's core would otherwise add them again.
+                let group = group.as_mapping_mut().ok_or("Invalid subscription.")?;
+                group.remove("include-all");
+                group.remove("include-all-proxies");
+                if all {
+                    group.insert("include-all-providers".into(), true.into());
+                }
             }
             let excluded_types = group["exclude-type"].as_str().unwrap_or("").to_string();
             let mut seen = std::collections::HashSet::new();
@@ -749,6 +755,11 @@ mod tests {
                 .len(),
             2
         );
+        // The server test runs this profile: the core must not add the listed servers a second time.
+        for group in profile["proxy-groups"].as_sequence().unwrap() {
+            assert!(group.get("include-all").is_none() && group.get("include-all-proxies").is_none());
+            assert_eq!(group["include-all-providers"].as_bool(), Some(true));
+        }
         assert!(
             picker_profile("proxy-groups: [{name: Main, filter: '[invalid'}]", "Main").is_err()
         );

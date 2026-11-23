@@ -603,7 +603,7 @@ function friendlyError(error){
  if(/device identification/i.test(String(error?.message||error)))return "Device identification is unavailable. Restart macOS and try again.";
  const text=String(error?.message||error||'');
  /* the app's own sign-in messages are already worded for the person */
- if(/^(That code is not right|Too many attempts\. Request|Too many codes today|New accounts by email are closed|This sign-up has expired|Sign-in was not completed|Could not open the browser|You can request a new code|This sign-in method is unavailable|Unknown sign-in method|Enter the six-digit code|Enter a valid email|Please accept both agreements|This code has expired)/.test(text))return text;
+ if(/^(Sign-in was cancelled|The sign-in request expired|That code is not right|Too many attempts\. Request|Too many codes today|New accounts by email are closed|This sign-up has expired|Sign-in was not completed|Could not open the browser|You can request a new code|This sign-in method is unavailable|Unknown sign-in method|Enter the six-digit code|Enter a valid email|Please accept both agreements|This code has expired)/.test(text))return text;
  if(/add route:.*file exists|tun_route_conflict/i.test(text))return 'Another VPN is using whole-device routes. Disconnect it, then connect again.';
  if(/TUN adapter could not start/i.test(text))return /permission denied|not permitted/i.test(text)?'The VPN adapter needs administrator access. Reinstall the network helper and try again.':'The macOS VPN adapter could not start. Disconnect other VPNs and try again.';
  if(/sign in again|session expired|HTTP 401|not signed in/i.test(text))return 'Please sign in again.';
@@ -740,7 +740,7 @@ async function useSubscription(id){
 }
 async function watchTraffic(){await invoke("watch",{on:S.screen==="conns"&&S.conn==="connected"&&!S.paused&&!document.hidden})}
 function legalLink(key,label){const doc=S.legal?.docs.find(d=>d.key===key);return `<a class="legal-link" href="${esc(doc?.url||'#')}" data-act="legal-link" data-key="${key}">${label}</a>`}
-/* Sign-in: the methods the server offers, a browser hand-off confirmed with a short code, or an emailed code. No passwords. */
+/* Sign-in: the methods the server offers, a browser sign-in that returns through akimovvpn://, or an emailed code. No passwords. */
 const LOGIN_ORDER=["telegram","google","yandex","email"],LOGIN_NAME={telegram:"Telegram",google:"Google",yandex:"Yandex ID",email:"Email"};
 const LOGIN_ICON={
  telegram:'<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path fill="#2AABEE" stroke="none" d="M21.2 4.4 2.9 11.5c-1.2.5-1.2 1.2-.2 1.5l4.7 1.5 1.8 5.5c.2.6.4.8.9.8.4 0 .6-.2.9-.4l2.3-2.2 4.7 3.5c.9.5 1.5.2 1.7-.8l3.1-14.5c.3-1.3-.5-1.9-1.6-1.5Z"/></svg>',
@@ -748,7 +748,7 @@ const LOGIN_ICON={
  yandex:'<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="11" fill="#FC3F1D" stroke="none"/><text x="12" y="16.6" text-anchor="middle" font-family="Arial,sans-serif" font-weight="700" font-size="13" fill="#fff" stroke="none">Я</text></svg>',
  email:'<svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="4.5" width="15" height="11" rx="2"/><path d="m3 5.5 7 5.5 7-5.5"/></svg>'
 };
-let methodsLoading=false,oauthTimer=0,oauthSeq=0,resendTimer=0,oauthCancelling=Promise.resolve();
+let methodsLoading=false,resendTimer=0,oauthCancelling=Promise.resolve();
 addEventListener("online",()=>{if(S.auth.offline&&!S.signed_in)void loadMethods(true)});
 const lastLogin=()=>{try{return localStorage.getItem("akimov:last-login")}catch{return null}};
 const rememberLogin=m=>{try{localStorage.setItem("akimov:last-login",m)}catch{}};
@@ -779,8 +779,8 @@ function signInScreen(){
  const tiles=enabled.length>1?`<div class="auth-tiles" role="group" aria-label="Sign-in method" style="--n:${enabled.length}">${enabled.map(k=>`<button type="button" class="auth-tile" data-act="auth-method" data-v="${k}" aria-pressed="${k===current}" ${a.oauth||S.authBusy?"disabled":""}>${last===k?'<span class="auth-badge">Last used</span>':""}${LOGIN_ICON[k]}<span>${LOGIN_NAME[k]}</span></button>`).join("")}</div>`:"";
  let panel="";
  if(current==="email")panel=emailPanel();
- else if(current&&a.oauth)panel=`<div class="auth-wait" role="status"><p class="cap">Enter this code in your browser to finish signing in with ${LOGIN_NAME[a.oauth.provider]}:</p><div class="auth-confirm">${esc(a.oauth.confirm)}</div><p class="cap dim">Waiting for your browser…</p><div class="auth-row"><button type="button" class="btn" data-act="auth-oauth-cancel">Cancel</button><button type="button" class="btn quiet" data-act="auth-oauth" data-v="${a.oauth.provider}">Start again</button></div></div>`;
- else if(current)panel=`<button type="button" class="btn primary block auth-provider" data-act="auth-oauth" data-v="${current}" ${S.authBusy?"disabled":""}>${LOGIN_ICON[current]}<span>Continue with ${LOGIN_NAME[current]}</span></button><p class="cap dim auth-hint">Opens your browser. You'll confirm there with a short code.</p>`;
+ else if(current&&a.oauth)panel=`<div class="auth-wait" role="status"><p class="cap">Finish signing in with ${LOGIN_NAME[a.oauth.provider]} in your browser. You'll come back here automatically.</p><p class="cap dim">Waiting for your browser…</p><div class="auth-row"><button type="button" class="btn" data-act="auth-oauth-cancel">Cancel</button><button type="button" class="btn quiet" data-act="auth-oauth" data-v="${a.oauth.provider}">Start again</button></div></div>`;
+ else if(current)panel=`<button type="button" class="btn primary block auth-provider" data-act="auth-oauth" data-v="${current}" ${S.authBusy?"disabled":""}>${LOGIN_ICON[current]}<span>Continue with ${LOGIN_NAME[current]}</span></button><p class="cap dim auth-hint">Opens your browser, then brings you back here.</p>`;
  const quiet=!m.email&&m.email_signin&&!a.oauth?(current!=="email"?'<button type="button" class="auth-link auth-email-link" data-act="auth-email-open">Sign in with email</button>':enabled.length?'<button type="button" class="auth-link auth-email-link" data-act="auth-email-close">Other ways to sign in</button>':""):"";
  const note=a.offline?'<p class="cap auth-note" role="status">Can’t reach the server. Check your connection and try again.</p>':"";
  return `<section class="auth-wrap"><div class="auth-col">${lockup}${note}${tiles}<div class="auth-panel">${panel}</div>${quiet}</div></section>`;
@@ -929,21 +929,16 @@ Object.assign(act,{
   }
 });
 async function signedIn(me){stopOAuth(false);S.auth.step='email';S.auth.emailOpen=false;engineBoot(await invoke('boot'));applyMe(me);go('home');paintScreen('home');if(await ensureSubscription())await loadNodes()}
-function stopOAuth(tell=true){oauthSeq++;clearTimeout(oauthTimer);if(S.auth.oauth&&tell)oauthCancelling=invoke('cabinet_oauth_cancel').catch(()=>{});S.auth.oauth=null}
-/* The browser finishes the sign-in; the app asks every 1.5 s. A finished sign-in always counts, a stale answer otherwise changes nothing */
-async function pollOAuth(seq=oauthSeq){
- if(seq!==oauthSeq||!S.auth.oauth||S.signed_in)return;
- const provider=S.auth.oauth.provider;let result;
- try{result=await invoke('cabinet_oauth_poll')}catch(error){if(seq!==oauthSeq)return;S.auth.oauth=null;report(error);rr();return}
- if(result?.status==='signed_in'){rememberLogin(provider);try{await signedIn(result.me)}catch(error){report(error)}return}
- if(seq!==oauthSeq)return;
- if(result?.status==='expired'){S.auth.oauth=null;toast('The sign-in request expired. Start again.');rr();return}
- oauthTimer=setTimeout(()=>pollOAuth(seq),1500);
+function stopOAuth(tell=true){if(S.auth.oauth&&tell)oauthCancelling=invoke('cabinet_oauth_cancel').catch(()=>{});S.auth.oauth=null}
+/* Rust finished (or ended) the browser sign-in from the akimovvpn:// link. A finished sign-in always counts */
+async function oauthDone(result){
+ if(result?.status==='signed_in'){rememberLogin(result.provider);try{await signedIn(result.me)}catch(error){report(error)}return}
+ if(!S.auth.oauth)return;S.auth.oauth=null;report(result?.message||'Sign-in was not completed. Try again.');rr();
 }
 function tickResend(){clearInterval(resendTimer);resendTimer=setInterval(()=>{const b=$('[data-act="auth-email-resend"]'),wait=Math.max(0,Math.ceil((S.auth.sentAt+60000-Date.now())/1000));if(S.signed_in||S.auth.step!=='code'||!b){clearInterval(resendTimer);return}b.disabled=wait>0;b.textContent=wait>0?`New code in ${wait} s`:'Send a new code';if(!wait)clearInterval(resendTimer)},1000)}
 act['auth-method']=el=>{if(S.auth.offline)void loadMethods(true);if(S.authBusy||S.auth.oauth)return;S.auth.method=el.dataset.v;S.auth.emailOpen=false;rr()};
 act['auth-oauth']=async el=>{if(S.authBusy)return;const provider=el.dataset.v;stopOAuth(false);S.authBusy=true;rr();
- try{await oauthCancelling;const result=await invoke('cabinet_oauth_start',{provider});S.auth.oauth={provider,confirm:String(result.confirm_code||'')};S.auth.method=provider;const seq=oauthSeq;oauthTimer=setTimeout(()=>pollOAuth(seq),1500)}
+ try{await oauthCancelling;await invoke('cabinet_oauth_start',{provider});S.auth.oauth={provider};S.auth.method=provider}
  catch(error){report(error)}finally{S.authBusy=false;if(!S.signed_in)rr()}};
 act['auth-oauth-cancel']=()=>{stopOAuth();rr()};
 act['auth-email-open']=()=>{if(S.auth.oauth)return;S.auth.emailOpen=true;rr()};
@@ -986,6 +981,7 @@ async function boot(){
     if(p.conns&&!S.paused){const counts=new Map();const previous=new Map(S.conns.map(c=>[c.id,c]));S.conns=p.conns.map(c=>{const signature=JSON.stringify([c.host,c.port,c.proc,c.chains]),i=counts.get(signature)||0;counts.set(signature,i+1);const key=c.id||signature+":"+i;let id=trafficIds.get(key);if(!id){id=++uid;trafficIds.set(key,id)}const target=(c.chains||[]).some(n=>/reject|block/i.test(n))?"@block":(c.chains||[]).some(n=>/^direct$/i.test(n))?"@direct":"@proxy";const own=S.rules.find(r=>r.on&&r.type.replace(/[-_]/g,"").toUpperCase()===(c.rule||"").replace(/[-_]/g,"").toUpperCase()&&r.value===c.payload);return{...c,connectionId:c.id,host:c.host||"",proc:c.proc||"",id,route:TARGET[target][1],origin:own?"user":c.rule==="Match"||c.rule==="MATCH"?"default":"plan",rule:c.rule&&c.rule.toUpperCase()!=="MATCH"?{type:c.rule,value:c.payload||"",target}:null,dirty:!previous.has(id)||previous.get(id).route!==TARGET[target][1]||previous.get(id).rule?.value!==(c.payload||"")}});const ids=new Set(S.conns.map(c=>c.id));for(const[id,el]of connEls)if(!ids.has(id)){collapse(el,()=>el.remove());connEls.delete(id)}if(trafficIds.size>1000)for(const[key,id]of trafficIds)if(!ids.has(id))trafficIds.delete(key);if(S.screen==="conns")syncConns()}
   });
   await window.__TAURI__.event.listen("tray-toggle",()=>{toggle().catch(report)});
+  await window.__TAURI__.event.listen("oauth",({payload})=>oauthDone(payload));
   await window.__TAURI__.event.listen("dropped",()=>{S.conns=[];connEls.clear();S.secs=0;setConn("idle");if(["home","conns"].includes(S.screen))rr();toast("Disconnected. The VPN core stopped.")});
   const core=await invoke("boot");engineBoot(core);paintScreen(S.screen);
   try{S.cabinet=await invoke("cabinet_boot");S.signed_in=S.cabinet.signed_in;const known=S.cabinet.me||S.signed_in&&cacheGet("/me");if(known)applyMe(known);if(!S.signed_in)cacheClear();if(S.cabinet.error)background(S.cabinet.error)}catch(error){background(error)}finally{S.restoring=false;paintScreen(S.screen);void hideSplash()}
